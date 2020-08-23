@@ -1,0 +1,58 @@
+#include"headers.h"
+
+// IN FILE EVERYTHING IS STORED AS CHARACTERS
+
+// LOW LEVEL FILE HANDLING PROBLEMS
+// read command has return value of how many bytes it has succesfully read
+// write command writes on the standard output system having a file discripter as 1 or the required bytes used in writing  
+
+// Keep noticing about the return value of th fgets and fputs function
+
+// return value of fgets is a pointer or NULL pointing to the line which is terminated by \0 -- file pointer incrementes by the whole line
+// fgets also reads the \n character since it only stops at \0
+// return value of fgetc is a unsigned char which is type casted to integer  -- file pointer increments by only 1 byte. 
+
+// strtok is used to tokenise the string consider given example
+// 1 kishan 1000
+// . .      .
+// . .      .
+// 40 jay 13323
+// .. if the file contains this data , notice that the data is not divided properly in rows and columns so u need to access this values?
+// But u don't know where are the spaces and where will the data start
+// best option is use strtok
+// make use of fgets() store the whole line in a string and tokenise the string
+// token = strtok(line,"string")  in this token in character pointer and "string" is nothing value set of characters to be skipped in file
+// So printing the string will give u 1st data value in this case Sr no.
+// next time us use strtok use like -- token = strtok(NULL,"string") Thus it keeps the track of pervious value pointed.
+
+
+#define MAX 100
+
+int main(int argc,char *argv[]){
+    char s[MAX],line[MAX];
+    FILE *fp;
+    if(argc > 1)
+    for(int i = 0;i < strlen(argv[1]); i++){
+        s[i] = *(argv[1]+i);
+    }
+    else{
+        printf("usage of this code is :-  ./exe filename.txt \n");
+        exit(1);
+    }
+    open_files_write(s,&fp);
+    
+    fgets(line,1024,fp); 
+    char *token;
+    int num;
+    token = strtok(line," ");  
+    printf("%s\n",token);
+    token = strtok(NULL," ");
+    printf("%s\n",token);
+    num = atoi(strtok(NULL," "));
+    printf("%d",num);
+    
+    return 0;
+}
+
+     
+

@@ -1,0 +1,103 @@
+#include"headers.h"
+#define MAX 1024
+
+// write a function that exactly acts as strtok and also write a function fgets; 
+                                       
+int get_file_line(FILE **fp,char s[]);              //function returns 1 if it reads a line and -1 otherwise
+char *strtok_h(char line[],const char str[]);
+
+int main(int argc,char *argv[]){
+        FILE *fp;
+        char s[MAX];
+        char *line,*token;
+        int c;
+        if(argc != 2){
+            printf("the usage of the code is :- ./exe filename\n");
+            exit(EXIT_FAILURE);
+        }
+        open_files_read(argv[1],&fp);
+
+        c = get_file_line(&fp,s);
+        token = strtok_h(s," ");
+        printf("%s\n",token);
+        token = strtok_h(NULL," ");
+        printf("%s\n",token);
+        token = strtok_h(NULL," ");
+        printf("%s\n",token);
+
+        return 0;
+}
+int get_file_line(FILE **fp,char s[]){
+    int i = 0,c;
+    while((c=fgetc(*fp)) != EOF){
+            if(c != '\n'){
+                s[i++] = c;
+            }
+            else if(c=='\n')
+                break;
+    }
+    if(c == '\n'){
+        s[i] = '\0';
+    }
+    return (c==EOF) ? -1 : 1;
+}
+
+char *strtok_h(char *line,const char str[])
+{
+int pointing,flag=0;
+static char *p;
+    if(line == NULL){
+        for(int i =1;*(p+i)!='\0';i++){
+            for(int j=0;j < strlen(str);j++){
+                if(*(p+i) == str[j]){
+                    p = p + 1;
+                }
+                else{
+                    p = p + 1;
+                    flag = 1;
+                }
+            }
+            if(flag)
+                break;
+        }
+        p = p+1; 
+        for(int i=0;*(p + i)!='\0';i++){
+            for(int j = 0;j < strlen(str); j++){
+                if(*(p + i) == str[j]){
+                    *(p + i) = '\0';
+                    pointing = i;
+                    p = p + i;
+                    break;
+                }
+            }    
+        } 
+    }
+    else{
+        p = line;
+        for(int i=0;*(line + i)!='\0';i++){
+            for(int j = 0;j < strlen(str); j++){
+                if(*(line + i) == str[j]){
+                    *(line + i) = '\0';
+                    pointing = i;
+                    p = p + i;
+                    flag = 1;
+                    break;
+                }
+            }    
+            if(flag){
+                break;
+            }
+        }
+    }
+    
+    
+return (p-pointing);
+}
+
+
+
+
+
+
+
+

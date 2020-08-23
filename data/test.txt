@@ -1,0 +1,2614 @@
+/*Test dynamics code file for Reaction wheel module
+
+  Changes made:
+  - New Variables:
+  - rw_w, rw_angmom, rw_angmomdot
+  - t_rw
+  - New function:
+  - update_rw: updates the state of the reaction wheel
+
+  - In getwdot()
+  - included the components of reaction wheel in hdot calculations.
+  - Inertia of reaction wheel is assumed to be scalar and not tensor. Improve in future.
+
+*/
+// In findTorque():
+//Here the torque is both, what is required and what is provided (As on 2nd April, 2016, when we were trying to check control law).
+//Also to test reaction wheel, t_rw is required. So for that, whatever torque is calculated, it is assumed that the Y-axis component
+// of this torque is provided by reaction wheel (check the function update_rw()).
+//In future, the implementation of the findTorque() should be such that it should first calculate what is required and then how it CAN be
+// provided by the actuators by distribution of torque among them. Then, the t_rw will be the torque provided by the reaction wheel.
+// Torque provided by the reaction wheel is negation of torque felt by it (Newton's third law, see update_rw()).
+/*The dynamics code implemented on 6/7/11 */
+/*Last updates:02/08/2013*/
+/*Last Update: 31/08/2013*/
+/*Last Update: 10/09/2013*/
+/*Last Update: 14/12/2015*/
+/*This is the latest edition of dynamics code updated on 14/12/2015*/
+/*
+   1. Macros for Cross and dot products of vectors implemented.
+   2. Functions for Attitude Determination using TRIAD method
+   3. Modified control law (B-dot and  Nadir pointing)
+   */
+/*This code includes Calculation of:
+  1. orientation
+  2. angular velocity
+  3. Torque (for above two prameters)
+  4. roll ,pitch and yaw in orbit frame
+  5. thermals
+  6. power through solar panels
+  7. stabilization detection
+  8. TRIAD algorithm for ADS
+  9. Nadir Pointing
+  */
+
+/*Flow of Calculation:
+  1. Variables initialization by calling intialize_variables() function
+  2. In loop:
+  i.   Reading orbital parameters from file
+  ii.  Finding Torque: findtorque()
+  iii. TRIAD Attitude Determination
+  a. Rotation matrix from quaternion is calculated in find torque
+  b. Torques: Gravity gradient, Atmospheric, Magnetic.
+  iii. Thermals and Power calculations: thermal_power()
+  iv.  Calculating Rollm Pitch and Yaw: rpy()
+  v.   Stabilization detection: stabilization()
+  vi.  Rate of gyro and quaternion
+  vii. Runge Kutta for estimation of next quaternion and angular velocity
+  */
+
+#include"header.h"
+#include"dynamics.h"
+#include<errno.h>
+
+//  all functions realated to unscented kalman filtering are declared in this header file -
+#include"ktools.h"                     
+
+// ***FINDS THE QUATERNION RATE OF CHANGE*** //
+#define getqdot(q,w,k)( k[0] = (q[1]*w[2] - q[2]*w[1] + q[3]*w[0]+ w[3]*q[0])/2, k[1] = (-q[0]*w[2] + q[2]*w[0] + q[3]*w[1] + w[3]*q[1])/2, k[2] = (q[0]*w[1] - q[1]*w[0] + q[3]*w[2] + w[3]*q[2])/2, k[3] = (q[3]*w[3]-q[0]*w[0] - q[1]*w[1] - q[2]*w[2])/2)
+
+#define normalize(vector,magnitude)(vector[0] = vector[0]/magnitude,vector[1] = vector[1]/magnitude,vector[2] = vector[2]/magnitude,vector[3] = vector[3]/magnitude)
+
+#define eceftoeci(eci,ecef,sidereal)(eci[0] = cos(sidereal) * ecef[0]  - sin(sidereal) * ecef[1], eci[1] = sin(sidereal) * ecef[0]  + cos(siderealTime) * ecef[1], eci[2] = ecef[2])
+
+#define Rotate(rotmat,vector,rvector)(rvector[0] = rotmat[0][0] * vector[0] + rotmat[0][1]*vector[1] + rotmat[0][2] * vector[2], rvector[1] = rotmat[1][0]*vector[0] + rotmat[1][1]*vector[1] + rotmat[1][2]*vector[2], rvector[2] = rotmat[2][0] *vector[0] + rotmat[2][1]*vector[1] + rotmat[2][2] * vector[2])
+
+#define Cross(product, v1, v2)(product[0] = v1[1]*v2[2]-v1[2]*v2[1], product[1] = v1[2]*v2[0] - v1[0]*v2[2], product[2] = v1[0]*v2[1] - v1[1]*v2[0])
+
+#define transpose(rotr ,rotmat)(rotr[0][0] = rotmat[0][0], rotr[0][1] = rotmat[1][0], rotr[0][2] = rotmat[2][0], rotr[1][0] = rotmat[0][1], rotr[1][1] = rotmat[1][1], rotr[1][2] = rotmat[2][1], rotr[2][0] = rotmat[0][2], rotr[2][1] = rotmat[1][2], rotr[2][2] = rotmat[2][2] )
+
+#define dotprod(prod, v1, v2)(prod = (v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]))
+
+#define DEBUG 0         // DEBUG VARIABLE ALLOWS TO VIEW ALL THE VARIABLES REALATED TO KALMAN FILTER FOR A PARTICULAR ITERATION
+#define DEBUG2 0
+#define test 0			//debugging...13 points at 0 distance
+#define run_mult 0
+#define beg (3945)      //beg and fin are the time interval where u need to debug the code
+#define fin (3940)
+#define torq_cons 4
+#define start (1400000)
+#define end (start + 55 * 600)
+#define lp (0)
+#define commcurrent (3.28)	//communication
+#define peakcurrent (7.5258)	//solar panel
+#define efficiency (0.85)	//charging efficiency
+#define beaconcurrent (0.90166)
+#define contcurrent (0.76142)
+#define maxcapacity (20.4*60*60)
+#define mincos (0.442506)
+double Tcurrent = maxcapacity;
+double pointvec[3] = {0,0,1};
+int gcount = 0;
+double Bearth[3];
+double ref_vector[3];
+double days,siderealTime;
+int i;
+double latitude = 0.000049, longi = 44.934248, rad = 7079.291094;
+double Pgrand[6];
+double Daycount =0, Eclipsecount = 0;
+double Facetotal = 0;
+int fpr,fweci;
+int fTorque,fTmagtorquer,fTgd,fTatm,fwdot, fangMom, f_struct;
+char print_T[100],print_fTmagtorq[100],print_fTgd[100],print_fTatm[100], print_struct[100];
+int rvalue;
+double r_eci[3],r_body[3];
+int ct = 0;
+double mresidual[3];
+double max_residual;
+double MagnitudeBearth, tbdot[3];//added 28/7/15
+double Bprev[3],Mgen[3],magnitudew0; //added  12/08/15
+double kgain[3], pointang[3] = {0,0,0}, pointchange[3]= {0,0,0}, ecichange[3], eciang[3],velbody[3],magnitude2;
+FILE *fmaggen, *fzangles, *fbdot, *fpointang, *feciang, *fMcurrent, *fc1, *fcap, *ferror1,*fIGRF,*fMbody,*fresults,*fsen;
+//long double kgain = 210000000;
+double Bdot[3] = {0} , Bdotprev[3] = {0};
+double pwr[3] = {0}, pwrp[3] = {0}, current[3] = {0}, energy;//added 11/12/15
+double magprev[3], w0prev2[3] = {0}, w0prev[3]= {0}, angxcount=0, angycount=0,angzcount=0; //added 11/12/15
+double eci1[3] = {0,0,0}, efec1[3] = {0,0,0}, reci1[3] = {0,0,0}; //added 8/12/15
+double tnadir[3], ktheta, komega, eigvec[3], errnadir[3], mageigen, ecef1[3], reci1b[3];
+double rotorbit[3][3], magnitudereci, orbith1[3], maguorbith, aeci1[3], uorbith1[3], zaxis[3], zaxisorb[3], w0orb[3], dotpr,vnadir[3], vnadirb[3]; //added 09/12/15
+double xaxis[3], xaxisorb[3], yaxis[3], yaxisorb[3];
+FILE *ferrnadir, *fsunang, *fqorb, *fqorbframe, *fsenvector, *fstate;
+double sun_prod,angle_sun, angle_sunp, rSun, unitSun[3], sunPosition[3], unitSunorb[3], reci1orb[3], magsatsun, satisun[3], rotate_theta;//added 18/12/15
+double rotationpoint[3][3], raisevec[3], raisevecb[3], raisevececi[3], rorbtoeci[3][3], posdotprod;
+double qorb[4]; //added 21/12/15
+double matB[3][3], inverse[3][3], detmatB, magtn, magtnd, tnadiru[3], Bearthu[3], prodBT, thetaBT, knadir, tnadirc[3], tnadirc[3];
+int cc, cx;
+FILE *fzaxiscomm, *fpwrang, *fangmomentum;
+double rotinverse[3][3], rotb_to_orb[3][3], rotorb_to_b[3][3];
+//_IL_* hyst1x,atm,tmagnet,grav,hyst1y,hyst2x,hyst2y;
+//Constants added for the gs pointing during nadi pointing
+double gs_lat = 18, gs_long = 73, gs_vec[3], gs_vec_eci[3], maggsvec, magsatgs, elev, prodelev, satgs[3], satgsu[3];
+double rw_w[3], rw_angmom[3], rw_angmomdot[3], t_rw[3];
+int rw_saturated = 0;
+FILE *freact, *frpy_rep;
+char rpyrep[100], reacwheel[50];
+double tnadirrw[3], tnadirmt[3], Mgenrw[3], Mgenmt[3], errorrw, errormt, tnadirctemp[3];
+double wheel_power;
+int torq_flag;
+
+//double generate_gaussian(double , double);
+//void quaternion_to_matrix(double *q,double rot[3][3]);
+//double determinant(double [][6], double);
+//void cofactor(double [][6], double, double [][6]);
+//void transpose1(double [][6], double [][6], double, double [][6]);
+void update_rw() {
+    //	int l;
+    rw_angmomdot[0]	= -1 * t_rw[0] * 0;
+    rw_angmomdot[1]	= -1 * t_rw[1];
+    rw_angmomdot[2]	= -1 * t_rw[2] * 0;
+
+    rw_angmom[0] = rw_angmom[0] + rw_angmomdot[0] *interval_sim;
+    rw_angmom[1] = rw_angmom[1] + rw_angmomdot[1] *interval_sim;
+    rw_angmom[2] = rw_angmom[2] + rw_angmomdot[2] *interval_sim;
+
+    //	rw_angmom[0] = 0;
+    //	rw_angmom[1] = 0;
+    //	rw_angmom[2] = 0;
+
+    // This may seem odd that the velocity is only found after getting the angular momentum. We will use trhis only to find if wheel is saturated.
+    rw_w[0] = 0;
+    rw_w[1] = rw_angmom[1]/(17.13e-5);
+    rw_w[2] = 0;
+    if(fabs(rw_w[1])*30/_pi > 6000)
+    {
+        rw_saturated = 1;
+    }
+    //	printf("%d\t%d\t%lf\n",i, rw_saturated, rw_w[1]);
+
+    fprintf(freact,"%lf\t%e\t%lf\t%lf\t%lf\t%lf\n",run_time/86400, fabs(rw_angmomdot[1]), rw_angmom[1], rw_w[0],rw_w[1] , rw_w[2]);
+
+
+}
+double torqueError (double*, double*);
+void capacity(double*, double*, int);
+
+// quaternion addition implies quaternion multiplication 
+void qmul(double* c, double* a, double* b){
+    c[3] = a[3] * b[3] - a[1] * b[1] - a[2] * b[2] - a[0] * b[0];
+    c[0] = a[1] * b[2] - a[2] * b[1] + a[3] * b[0] + a[0] * b[3];
+    c[1] = a[1] * b[3] + a[3] * b[1] - a[0] * b[2] + a[2] * b[0];
+    c[2] = a[0] * b[1] - a[1] * b[0] + a[2] * b[3] + a[3] * b[2];
+}
+// quaternion subtraction implies quaternion multiplication with it's inverse 
+void qmuli(double* c, double* a, double* b){
+    c[3] = +a[1] * b[1] + a[2] * b[2] + a[3] * b[3] + a[0] * b[0];
+    c[0] = -a[1] * b[2] + a[2] * b[1] - a[3] * b[0] + a[0] * b[3];
+    c[1] = +a[1] * b[3] - a[3] * b[1] + a[0] * b[2] - a[2] * b[0];
+    c[2] = +a[1] * b[0] - a[0] * b[1] + a[2] * b[3] - a[3] * b[2];
+}
+
+/*The main code which uses the fourth order Runge Kutta method for solving simultaneous equations */
+void dynamics() {
+    double theta;
+    double rollecef,pitchecef,yawecef;
+    char print_strdyn[100];
+    double q_sigma[25][4], w_sigma[25][4],m_sigma[25][4],torque[3], q_predicted[4], q_error_mean[4], w_predicted[4], w_error_mean[4];
+    double bias[4],m_predicted[4],m_error[25][4], m_error_mean[4],z_sigma[25][4],sensor[6],IGRF[3],Mrotbody[3],num = 0; 
+    double gyrob[4],gyrob_predicted[4],gyrob_error[25][4],gyrob_error_mean[4],gyrob_sigma[25][4],gz_sigma[25][4]; 
+    double z[25][6], zm[6], update[13];
+    double q_error[25][4], w_error[25][4], weci[3];
+    double kq1[4], kq2[4], kq3[4], kq4[4];
+    double kw1[4], kw2[4], kw3[4], kw4[4];
+    double param1[4],param2[4],torque1[3], P[12][12], Pco[12][12], Pzz[6][6], Pxz[12][6], Kk[12][6], Kk_t[6][12], Pzzi[6][6], Rk[6][6], Qk[12][12];
+    double magnitude;
+    double angMomentum[3];
+    double m[3],temp1;
+    int kf, j, down, k, fw;
+    char print_string[100], print_string2[100],print_string3[100],print_stringweci[100],print_q[100];
+    count =0;
+    int finm,finpos,foutr,foutz,foutene, fq_stk;
+    char readvalue[100],readmag[100],printz[100];
+    double KE[4],PE[4],PEm,PEh,PEr,TE[4],KErateChange,PErateChange,TErateChange;
+    double netangle,Mnetmag, errorangle;
+    double Mnet[3];
+    double damp_time = 50;
+    int dflag = 1;
+    double alpha = sqrt(3), kappa = 0, lambda, wm[2], wc[2], beta = 2.0;
+    FILE *ftry;
+
+
+    double w_sigma_bias_free[25][4],kw1_b[4], kw2_b[4], kw3_b[4], kw4_b[4], param2_b[4];
+
+    // -------------------------------PARAMETER REALTED TO UNSCENTED KALMAN FILTER ----------------------------//
+
+    int L = 12;//size of state vector of kalman filter
+    int SV = 6;// defines the sensor vectors , not necessary that value sensor vectors are equal to state vectors  
+
+    // LAMBDA - scaling factor for the error covariance matrix 
+    lambda =  alpha * alpha * (L + kappa) - L; 
+
+    // wc -- weigths given to the covarinaces 
+    // wm -- weights given to the measurements 
+    // WEIGHTS ARE GIVEN INORDER TO APPROXIMATE THE OUTPUT GUASSIAN AFTER PASSING THROUGH A NON LINEAR FUNCTION --
+    wc[0] = 1.0 / (2.0 * (lambda + L));
+    wm[0] = wc[0];
+    wm[1] = lambda / (lambda + L);
+    wc[1] = wm[1] + (1.0 - alpha * alpha + beta);
+
+    /*
+       Qk - noise covariance matrix 
+       Qk signifies the error in the processof kalman itself ,more noise means worst estimate ,less noise better estimate
+       (KEEP THIS VALUE LARGE MEANS THAT KALMAN IS WORKING WORST)
+
+       Rk - measurement covariance matrix
+       Rk signifies the uncertainity in measurement of sensor
+       (THIS VALUE DEPENDS ON THE SENSORS)
+
+       P  - initial error covariance matrix
+       P significes how fast the convergence will take place,less value means a fast convergence,also that error variance is less
+       (DON'T KEEP THE VALUE TOO LARGE OTHERWISE KALMAN WON'T CONVERGE TO ACTUAL VALUE) 
+       
+    */  
+    matrix_initialize(L,L,P);
+    matrix_initialize(L,L,Qk);	
+    matrix_initialize(SV,SV,Rk);
+
+    P[0][0] = P[1][1] = P[2][2] = P[3][3] = P[4][4] = P[5][5] = 1e-3;
+    P[6][6] = P[7][7] = P[8][8] = 1e-4;
+    P[9][9] = P[10][10] = P[11][11] = 1e-3;
+
+    Qk[0][0] = Qk[1][1] = Qk[2][2] = 1e-6;
+    Qk[4][4] = Qk[5][5] = Qk[3][3] = 1e-5;
+    //Qk[6][6] = Qk[7][7] = Qk[8][8] = 1e-6;
+    Qk[9][9] = Qk[10][10] = Qk[11][11] = 1e-8;
+
+    Rk[0][0] = Rk[1][1] = Rk[2][2] = 2.7e-3;
+    Rk[3][3] = Rk[4][4] = Rk[5][5] = 12e-6;
+
+    //---------------------------------------------------------------------------------------------------------//	
+    printf("weights given to error- %f %f\nweights given to measurments- %f %f\n", wc[0], wc[1], wm[0], wm[1]);
+    if(run_mult)
+    {
+        printf("Put file name for reaction wheel\n");
+        scanf("%s", reacwheel);
+        printf("Put the file name for RPY\n");
+        scanf("%s", rpyrep);
+    }
+    /*
+       printf("put ktheta, komega\n");
+       scanf("%lf %lf", &ktheta , &komega);
+       printf("put pointvector\n");
+       scanf("%lf %lf %lf", &pointvec[0], &pointvec[1], &pointvec[2]);
+    */
+    ktheta = 5e-4;
+    komega = 5e-2;
+    /*
+       printf("With or without disturbance torques ? (1 / 0) ");
+       scanf("%d",&torq_flag);
+    */
+    torq_flag = 1;
+    /*Assigning initial power on all six solar panels as 0*/
+    for(down = 0; down < 6; down++) {
+        Pgrand[down] = 0;
+
+    }
+    // FILE DECLARATION FOR STORING THE OUPTUTS --
+    ftry = fopen("mean1.txt", "w");
+    initialize_variables();
+    fmaggen = fopen("MagMoment.txt", "w");
+    fzangles = fopen("Zangles.txt", "w");
+    fbdot = fopen("bdot.txt", "w");
+    fpointang = fopen("pointang.txt", "w");
+    feciang = fopen("eciang.txt", "w");
+    fMcurrent = fopen("currentvalue.txt", "w");
+    ferrnadir = fopen("thetaerror.txt", "w");
+    fsunang = fopen("sun_angle.txt", "w");
+    fqorb = fopen ("quaternionOrb.txt", "w");
+    fzaxiscomm = fopen("std_zaxis2.838-0.56-0.56-180_50C", "w");
+    fpwrang = fopen("Cosine_power.txt", "w");
+    fangmomentum = fopen("AngularMom.txt", "w");
+    fqorbframe = fopen("Orbitframe.txt", "w");
+    fcap = fopen("capacity.txt", "w");
+    fc1 = fopen("currents.txt", "w");
+    fstate = fopen("state.txt", "w");
+    ferror1 = fopen("error.txt", "w");
+    if(run_mult){
+        freact = fopen(reacwheel, "w");
+        frpy_rep = fopen(rpyrep, "w");
+    }
+    else{
+        freact = fopen("ReactionWheel.txt", "w");
+    }
+
+    finpos = open("orbital_bdot.txt",O_RDONLY|O_LARGEFILE);
+    if( finpos==-1) {
+        perror("the error is orbital_bdot.txt -");
+        exit(EXIT_FAILURE);
+    }
+    finm = open("magneticField_bdot.txt",O_RDONLY|O_LARGEFILE);
+    if( finm==-1) {
+        perror("the error is dynamics.txt -");
+        exit(EXIT_FAILURE);	
+    }
+
+    foutr = open(dname,O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE,S_IRWXU| S_IRWXO);
+    if(foutr == -1) {
+        perror("the error is output dynamics file -");
+        exit(EXIT_FAILURE);
+    }
+
+
+    fpr = open(rpyname,O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE,S_IRWXU| S_IRWXO);
+    if(fpr == -1) {
+        perror("the error is output dynamics roll pitch and yaw file -");
+        exit(EXIT_FAILURE);
+    }
+
+    sprintf(zaxis_printstring,"%s/std_zaxis%s", folder, filename);
+
+    foutz = open(zaxis_printstring,O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE,S_IRWXU| S_IRWXO);
+    if(foutz == -1) {
+        perror("the error is output pointing file -");
+        exit(EXIT_FAILURE);
+    }
+
+    fw = open(fangvel,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fw == -1) {
+        perror("the error is angularVelocity.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    fweci = open(fangveleci,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fweci == -1) {
+        perror("the error is ECIangularVelocity.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    /*        foutene = open(fene,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+              if(foutene == -1) {
+              printf("Can't creat energy.txt\n");
+              exit(1);
+              }*/
+
+
+    fTmagtorquer = open(fTmagtorq,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fTmagtorquer == -1) {
+        perror("the error is magnetorquer.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    fTgd = open(fTgrav,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fTgd == -1) {
+        perror("the error is gravitygradient.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    fTatm = open(fTatmdrag,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fTatm == -1) {
+        perror("the error is Atmtorque.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    fTorque = open(fT,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fTorque == -1) {
+        perror("the error is Torque.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+
+    fwdot = open(fwrate,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fwdot == -1) {
+        perror("the error is wdot.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    fangMom = open(fangmom,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fangMom == -1) {
+        perror("the error is angMomentum.txt -");
+        exit(EXIT_FAILURE);
+    }
+    fsenvector = fopen("sen.txt","r");
+    if(fsenvector == NULL) {
+        perror("the error is - sen.xt -");
+        exit(EXIT_FAILURE);
+    }
+
+
+    fq_stk = open(q_stk,  O_CREAT|O_WRONLY|O_TRUNC|O_LARGEFILE, S_IRWXU|S_IRWXO);
+    if(fq_stk == -1) {
+        perror("the error is q_stk -");
+        exit(EXIT_FAILURE);
+    }
+
+    fIGRF=fopen("IGRF.txt","r");
+    if(fIGRF == NULL){
+        perror("the error is IGRF -");
+        exit(EXIT_FAILURE);
+    }
+    fMbody = fopen("Mbody.txt","r");
+    if(fMbody == NULL){
+        perror("the error is Mbody -");
+        exit(EXIT_FAILURE);
+    }
+    fresults  = fopen("results_of_bias.txt","w");
+    if(fresults == NULL){
+        perror("the error is results_of_bias.txt -");
+        exit(EXIT_FAILURE);
+    }
+    fsen = fopen("sensor_pre.txt","w");
+    if(fsen == NULL){
+        perror("the error is sensor_pre.txt -");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Reaction wheel initialization*/
+    rw_angmom[0] = 0;
+    rw_angmom[1] = 0;
+    rw_angmom[2] = 0;
+
+
+    q_error[2*L][0] = q_error[2*L][1] = q_error[2*L][2] = 0;
+    q_error[2*L][3] = 1;
+
+    // Initializing the values of magnetometer and gyro biases as zero (initial value to filter)
+    bias[0] = bias[1] = bias[2] = bias[4] = 0; 
+    gyrob[0] = gyrob[1] = gyrob[2] = gyrob[3] = 0;
+
+    double min_angle = 180, max_angle = 0;
+    FILE *fp_angle = fopen("angledata.txt", "w");
+    /*Now calculate the next quaternion and angular velocity by the runge kutta method */
+    for(i = 0; i < samples; i++) {		
+        if(isnan(q0[0])) {
+            printf("NAN  -_- \n");
+            exit(1);
+        }
+        if(isnan(bias[0])){
+            printf("NAN is due to bias -_-\n");
+            exit(1);
+        }
+        if(isnan(gyrob[0])){
+            printf("NAN is due gyrob -_-\n");
+            exit(1);
+        }	
+        if((run_time/86400) > 1)
+        {
+            /*Ixx = Ixx*7/8 + 64/12;
+              Ixy = 1.0474566e-02;			//12 U with 64m2
+              Ixz = 2.5392211e-01;
+              Iyy = Iyy*7/8 + 64/12;
+              Iyz = 4.0635192e-01;
+              Izz = Izz*7/8 + 64/6;
+              invinertia[0][0] = 0.17993947;
+              invinertia[0][1] = -0.000340043;
+              invinertia[0][2] = -0.0042409;
+              invinertia[1][0] = 0;
+              invinertia[1][1] = 0.1806267;
+              invinertia[1][2] = -0.007744537;
+              invinertia[2][0] = 0;
+              invinertia[2][1] = 0;
+              invinertia[2][2] = 0.09313728;
+              Ixx = Ixx/3 + 64/24;		//3U with 32m2
+              Ixy = 1.0474566e-02;
+              Ixz = 2.5392211e-01;
+              Iyy = Iyy/3 + 64/24;
+              Iyz = 4.0635192e-01;
+              Izz = Izz/3 + 64/12;
+              invinertia[0][0] = 0.37190904071827535;
+              invinertia[0][1] = -0.0014499312339057919;
+              invinertia[0][2] = -0.01758800019797724;
+              invinertia[1][0] = 0;
+              invinertia[1][1] = 0.37219851158485173;
+              invinertia[1][2] = -0.028344851843293873;
+              invinertia[2][0] = 0;
+              invinertia[2][1] = 0;
+              invinertia[2][2] = 0.1874119343121395;//3U invi inertia deployed*/
+
+            /*160x160x260 : Deployed*/		//Considering sail mass as 800g
+            Ixx = Iyy = 1.34685 + 2*0.04038667;
+            Izz = 2.66667 + 2*0.022186667;
+
+            Ixy = (5.0474566e-05);
+            Ixz = (7.5392211e-04);
+            Iyz = (9.0635192e-05);
+            invinertia[0][0] = 0.6970666112602044;
+            invinertia[0][1] = -0.000024513434792808518;
+            invinertia[0][2] = -0.00019384872611151292;
+            invinertia[1][0] = -0.000024513434792808518;
+            invinertia[1][1] = 0.6970665108580392;
+            invinertia[1][2] = -0.000023297431553454265;
+            invinertia[2][0] = -0.00019384872611151298;
+            invinertia[2][1] = -0.000023297431553454265;
+            invinertia[2][2] = 0.3688621479578919;
+        }
+        //gcount++;
+        //printf("i=%d\trun_time=%lf\n", i, run_time);
+        rvalue = read(finpos,readvalue,87);
+        days = atof(strtok(readvalue,"\t"));
+        latitude = atof(strtok(NULL,"\t"));
+        longi = atof(strtok(NULL,"\t"));
+        rad = atof(strtok(NULL,"\t"));
+
+        fprintf(fstate, "%lf\t%lf\t%lf\t%lf\t%lf\t%lf\t%lf\t%lf\n", run_time, q0[0], q0[1], q0[2], q0[3], w0[0], w0[1], w0[2]);
+
+        //printf("%lf\t%lf\t%lf\t%lf\t", days, latitude, longi, rad);
+        siderealTime= atof(strtok(NULL,"\t"));
+        xvel = atof(strtok(NULL,"\t"));
+        yvel = atof(strtok(NULL,"\t"));
+        zvel = atof(strtok(NULL,"\n"));
+        //printf("%lf\t%lf\t%lf%lf\n", siderealTime, xvel, yvel, zvel);
+        rvalue = read(finm,readmag,54);
+        magx = atof(strtok(readmag,"\t"));
+        magy = atof(strtok(NULL,"\t"));
+        magz = atof(strtok(NULL,"\n"));
+        if(i == 0) {
+            Bprev[0] = Bearth[0] = 0;
+            Bprev[1] = Bearth[1] = 0;
+            Bprev[2] = Bearth[2] = 0;
+        }
+
+
+        matrix_initialize(L,L,Pco);
+        multiply_matrix_by_constant(L,L,(lambda+L),P);
+
+        /*cholesky factorization (upper triangular matrix) */
+        sqrt_of_symmetric_matrix(L,Pco,P,'u');
+
+        // INITIALIZING ALL SIGMA POINTS WITH PREDICTED VALUE OF STATE 
+        // NOTE ANGULAR VELOCITY AND BIAS ARE ALSO KEPT 4 DIMENSIONAL BECUASE TO MATCH WITH THE QUATERNION STATE SIGMA POINTS
+        // HOWEVER 4TH VECTOR OF ANGULAR VELOCITY AND BIAS IS ALWAYS KEPT AS 0 
+
+        if(DEBUG && run_time > beg && run_time <= fin) {
+            printf("ITERATION NO = %d    *****************************NEXT ITERATION***********************************\n",i);
+            printf("P\n");
+            matrix_display(L,L,P);
+            printf("Pco\n");
+            matrix_display(L,L,Pco);
+        }
+
+
+        /*generate sigma points*/
+        if(!test){
+            for(kf = 0; kf < 2 * L ; kf++){
+                for(j = 0; j < L; j++) {
+                    if(kf < L) {
+                        if(j < 3) {
+                            q_error[kf][j] = Pco[kf][j];
+                        }
+                        else if (j < 6 && j > 2){
+                            w_error[kf][j-3] = Pco[kf][j];
+                        }
+                        else if (j > 5 && j < 9){
+                            m_error[kf][j-6] = Pco[kf][j];
+                        }
+                        else{
+                            gyrob_error[kf][j-9] = Pco[kf][j];
+                        }
+                    }
+                    else {
+                        if(j < 3) {
+                            q_error[kf][j] = -Pco[kf-L][j];
+                        }
+                        else if (j < 6 && j > 2){
+                            w_error[kf][j-3] = -Pco[kf-L][j];
+                        }
+                        else if (j > 5 && j < 9){
+                            m_error[kf][j-6] = -Pco[kf-L][j];
+                        }
+                        else{
+                            gyrob_error[kf][j-9] = -Pco[kf-L][j];
+                        }
+                    }
+                }
+                // JUGAD FOR NORM CONSTRAINT IN QUATERNION ----
+                if((q_error[kf][0]*q_error[kf][0] + q_error[kf][1]*q_error[kf][1] + q_error[kf][2]*q_error[kf][2]) > 1){
+                    num = sqrt(q_error[kf][0]*q_error[kf][0] + q_error[kf][1]*q_error[kf][1] + q_error[kf][2]*q_error[kf][2]);
+                    q_error[kf][0] = q_error[kf][0] / num;
+                    q_error[kf][1] = q_error[kf][1] / num;
+                    q_error[kf][2] = q_error[kf][2] / num;
+                    q_error[kf][3] = 0;
+                }
+                else{
+                q_error[kf][3] = sqrt(1 - magnitude1(q_error[kf]));
+                }
+            }		
+
+
+            m_error[2*L][0] = m_error[2*L][1] = m_error[2*L][2] = m_error[2*L][3] = 0;
+            w_error[2*L][0] = w_error[2*L][1] = w_error[2*L][2] = w_error[2*L][3] = 0;
+            gyrob_error[2*L][0] = gyrob_error[2*L][1] = gyrob_error[2*L][2] = gyrob_error[2*L][3] = 0;   
+            q_error[2*L][3] = sqrt(1 - magnitude1(q_error[2*L]));
+
+            /* Pco[kf] is supposed to be a lower triangular matrix
+             * and it should be traversed column wise instead
+             * of that we have converted Pco to upper triangular and
+             * we traverse it row wise*/
+
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                qmul(q_sigma[kf], q_error[kf], q0);
+                w_error[kf][3]=0;
+                m_error[kf][3]=0;
+                gyrob_error[kf][3]=0;
+                w0[3]=0;
+                bias[3]=0;
+                gyrob[3]=0;
+                for(j = 0; j < 4; j++) {
+                    w_sigma[kf][j] = w0[j] + w_error[kf][j];
+                    m_sigma[kf][j] = bias[j] + m_error[kf][j];
+                    gyrob_sigma[kf][j] = gyrob[j] + gyrob_error[kf][j];
+                }
+            }
+        }
+        
+
+        if((DEBUG && run_time > beg && run_time <= fin)) {
+            printf("original, error, sigma points\n");
+            printf("quaternion -");
+            for(j = 0; j < 4; j++)
+                printf("%f ",q0[j]);
+            printf("\nangular velocity -");
+            for(j = 0; j < 3; j++)
+                printf("%f ",w0[j]);
+            printf("\nbais -");
+            for(j=0;j < 3 ;j++)
+                printf("%e ",bias[j]);
+            printf("\ngyro bias - ");
+            for(j = 0;j < 3;j++){
+                printf("%e ",gyrob[j]);
+            }
+            printf("\n\n");
+            printf("the q_error w_error and m_error gyro_error---- formed by the Pco ----\n");
+            for(kf = 0; kf < (2 * L + 1) ; kf++) {
+                for(j = 0; j < 4; j++)
+                    printf("%f ",q_error[kf][j]);
+                for(j = 0; j < 3; j++)
+                    printf("%f ",w_error[kf][j]);
+                for(j = 0;j < 3; j++)
+                    printf("%e ",m_error[kf][j]);
+                for(j = 0;j < 3; j++)
+                    printf("%e ",gyrob_error[kf][j]);
+                printf("\n");
+            }
+            printf("\n");
+            printf("generated q_sigma w_sigma and m_sigma gyrob_sigma---------\n");
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                for(j = 0; j < 4; j++)
+                    printf("%f ",q_sigma[kf][j]);
+                for(j = 0; j < 3; j++)
+                    printf("%f ",w_sigma[kf][j]);
+                for(j = 0;j < 3;j++)
+                    printf("%e ",m_sigma[kf][j]);
+                for(j = 0; j< 3; j++)
+                    printf("%e ",gyrob_sigma[kf][j]);
+
+                printf("\n");
+            }
+            printf("\n");
+        }
+        /*Now find the torque acting on the magnet and hysteresis material */
+
+        findTorque(q0, torque, 1);//findTorque1
+
+        update_rw();
+        //ads_triad();
+        //      printf("%e\t%e\t%e\n",torque[0],torque[1],torque[2]);
+        //              printf("%lf\t%lf\t%lf\n",rot[2][0],rot[2][1],rot[2][2]);
+        if (i>=1)
+        {
+            Bprev[0] = Bearth[0];
+            Bprev[1] = Bearth[1];
+            Bprev[2] = Bearth[2];
+        }
+        else
+        {
+            Bprev[0] = 0;
+            Bprev[1] = 0;
+            Bprev[2] = 0;
+        }
+        fprintf(fbdot, "%lf\t%lf\t%lf\n", Bdot[0] ,Bdot[1] ,Bdot[2]);
+        //Code to get nadir vector for pointing
+        ecefsat(ecef1);
+        ecef1[0] = ecef1[0]/1e3;
+        ecef1[1] = ecef1[1]/1e3;
+        ecef1[2] = ecef1[2]/1e3;
+        satgs[0] = -eci1[0] - gs_vec_eci[0];
+        //printf("ECF %lf\t%lf\t%lf\n",ecef[0],ecef[1],ecef[2]);
+
+        eceftoeci(eci1,ecef1,siderealTime);
+        magnitudereci = unitvector(reci1,eci1);
+        gs_vec[0] = Re *cos(gs_lat) * cos(gs_long)/1000;
+        gs_vec[1] = Re *cos(gs_lat) * sin(gs_long)/1000;
+        gs_vec[2] = Re *sin(gs_lat)/1000;
+        eceftoeci(gs_vec_eci,gs_vec,siderealTime);
+        satgs[1] = -eci1[1] - gs_vec_eci[1];
+        satgs[2] = -eci1[2] - gs_vec_eci[2];
+        maggsvec = unitvector(gs_vec_eci, gs_vec_eci);
+        magsatgs = unitvector(satgsu, satgs);
+        dotprod(prodelev, gs_vec_eci, satgsu);
+        elev = acos(prodelev);
+        vnadir[0] = -1*reci1[0];
+        vnadir[1] = -1*reci1[1];
+        vnadir[2] = -1*reci1[2];
+        //		printf("%lf\n", elev*180/_pi);
+        if(elev*180/_pi< 70 && 0)
+        {
+            vnadir[0] = satgsu[0];
+            vnadir[1] = satgsu[1];
+            vnadir[2] = satgsu[2];
+        }
+        /*else
+          {
+          vnadir[0] = -1*reci1[0];
+          vnadir[1] = -1*reci1[1];
+          vnadir[2] = -1*reci1[2];
+          }*/
+
+        orbith1[0] = eci1[1] * zvel - eci1[2] * yvel;
+        orbith1[1] = - eci1[0] * zvel + eci1[2] * xvel;
+        orbith1[2] =  eci1[0] * yvel - eci1[1] * xvel;
+        maguorbith = unitvector(uorbith1,orbith1);
+        aeci1[0] = (uorbith1[1]*reci1[2]-uorbith1[2]*reci1[1]);
+        aeci1[1] = (-uorbith1[0]*reci1[2] + uorbith1[2]*reci1[0]);  //here instead of r x u, uxr is done. therefore the negative sign of reci is compensated in aeci
+        aeci1[2] = (uorbith1[0]*reci1[1] - uorbith1[1]*reci1[0]);
+
+        rotorbit[0][0] = -reci1[0];
+        rotorbit[0][1] = -reci1[1];
+        rotorbit[0][2] = -reci1[2];
+        rotorbit[1][0] = uorbith1[0];
+        rotorbit[1][1] = uorbith1[1];
+        rotorbit[1][2] = uorbith1[2];
+        rotorbit[2][0] = aeci1[0];
+        rotorbit[2][1] = aeci1[1];
+        rotorbit[2][2] = aeci1[2];
+        zaxis[0] = rot[2][0];
+        zaxis[1] = rot[2][1];
+        zaxis[2] = rot[2][2];
+        xaxis[0] = rot[0][0];
+        xaxis[1] = rot[0][1];
+        xaxis[2] = rot[0][2];
+        transpose (rotinverse, rot);
+        rotb_to_orb[0][0] = rotorbit[0][0] * rotinverse[0][0] + rotorbit[0][1] * rotinverse[1][0] + rotorbit[0][2]*rotinverse[2][0];
+        rotb_to_orb[0][1] = rotorbit[0][0] * rotinverse[0][1] + rotorbit[0][1] * rotinverse[1][1] + rotorbit[0][2]*rotinverse[2][1];
+        rotb_to_orb[0][2] = rotorbit[0][0] * rotinverse[0][2] + rotorbit[0][1] * rotinverse[1][2] + rotorbit[0][2]*rotinverse[2][2];
+        rotb_to_orb[1][0] = rotorbit[1][0] * rotinverse[0][0] + rotorbit[1][1] * rotinverse[1][0] + rotorbit[1][2]*rotinverse[2][0];
+        rotb_to_orb[1][1] = rotorbit[1][0] * rotinverse[0][1] + rotorbit[1][1] * rotinverse[1][1] + rotorbit[1][2]*rotinverse[2][1];
+        rotb_to_orb[1][2] = rotorbit[1][0] * rotinverse[0][2] + rotorbit[1][1] * rotinverse[1][2] + rotorbit[1][2]*rotinverse[2][2];
+        rotb_to_orb[2][0] = rotorbit[2][0] * rotinverse[0][0] + rotorbit[2][1] * rotinverse[1][0] + rotorbit[2][2]*rotinverse[2][0];
+        rotb_to_orb[2][1] = rotorbit[2][0] * rotinverse[0][1] + rotorbit[2][1] * rotinverse[1][1] + rotorbit[2][2]*rotinverse[2][1];
+        rotb_to_orb[2][2] = rotorbit[2][0] * rotinverse[0][2] + rotorbit[2][1] * rotinverse[1][2] + rotorbit[2][2]*rotinverse[2][2];
+        qorb[3] = 0.5 * sqrt(1 + rotb_to_orb[0][0] + rotb_to_orb[1][1] + rotb_to_orb[2][2]);
+        qorb[0] = (0.25/qorb[3]) * (rotb_to_orb[1][2] - rotb_to_orb[2][1]);
+        qorb[1] = (0.25/qorb[3]) * (rotb_to_orb[2][0] - rotb_to_orb[0][2]);
+        qorb[2] = (0.25/qorb[3]) * (rotb_to_orb[0][1] - rotb_to_orb[1][0]);
+        if (i %10 == 0)
+            fprintf(fqorb, "%e\t%e\t%e\t%e\t%e\n", run_time,qorb[0], qorb[1], qorb[2], qorb[3]);
+        //		qorb[3] = 0.5 * sqrt(1 + rotorbit[0][0] + rotorbit[1][1] + rotorbit[2][2]);
+        //		qorb[0] = (0.25/qorb[3]) * (rotorbit[1][2] - rotorbit[2][1]);
+        //		qorb[1] = (0.25/qorb[3]) * (rotorbit[2][0] - rotorbit[0][2]);
+        //		qorb[2] = (0.25/qorb[3]) * (rotorbit[0][1] - rotorbit[1][0]);
+        /*	transpose (rotorb_to_b, rotb_to_orb);
+            qorb[3] = 0.5 * sqrt(1 + rotorb_to_b[0][0] + rotorb_to_b[1][1] + rotorb_to_b[2][2]);
+            qorb[0] = (0.25/qorb[3]) * (rotorb_to_b[1][2] - rotorb_to_b[2][1]);
+            qorb[1] = (0.25/qorb[3]) * (rotorb_to_b[2][0] - rotorb_to_b[0][2]);
+            qorb[2] = (0.25/qorb[3]) * (rotorb_to_b[0][1] - rotorb_to_b[1][0]);*/
+        //		if (i %10 == 0)
+        //		fprintf(fqorbframe, "%e\t%e\t%e\t%e\t%e\n", run_time, qorb[0], qorb[1], qorb[2], qorb[3]);
+
+        Rotate(rotorbit, zaxis, zaxisorb);
+        Rotate(rotorbit, xaxis, xaxisorb);
+        rSun = eciSunposition(sunPosition);
+        rSun = unitvector(unitSun,sunPosition);
+        //	Rotate(rotorbit, unitSun, unitSunorb);
+        //	Rotate(rotorbit, reci1, reci1orb);
+        satisun[0] = sunPosition[0] - eci1[0];
+        satisun[1] = sunPosition[1] - eci1[1];
+        satisun[2] = sunPosition[2] - eci1[2];
+        magsatsun = unitvector(unitSun, satisun);
+        dotprod(sun_prod, reci1, unitSun);
+        angle_sun = acos(sun_prod);
+        angle_sun = angle_sun * 180/_pi;
+        if(min_angle > angle_sun) min_angle = angle_sun;
+        if(max_angle < angle_sun) max_angle = angle_sun;
+
+        if(angle_sunp <= 90 && angle_sun > 90) {
+            fprintf(fp_angle, "min: %lf\n", min_angle);
+            //	    min_angle = 180;	
+        }
+        if(angle_sunp >= 90 && angle_sun < 90) {
+            fprintf(fp_angle, "max: %lf\n", max_angle);
+            //	    max_angle = 0;
+        }
+
+        if (angle_sun >= 90)
+            rotate_theta = 0;
+        else {
+            if (angle_sunp > angle_sun) {
+
+                rotate_theta = (-angle_sun * 45/(max_angle - 90)) + (45*90/(max_angle - 90));
+
+            }
+            else
+                rotate_theta = (angle_sun * 45/(max_angle - 90)) + 45 - (min_angle)*45/(max_angle - 90);
+        }
+
+        fprintf(ferrnadir, "%lf\t%lf\t%lf\t%lf\n", run_time/86400, errnadir[0], errnadir[1], errnadir[2]);
+        angle_sunp = angle_sun;
+        rotate_theta = rotate_theta * _pi/180;
+        fprintf(fsunang, "%d\t%lf\t%lf\n", i, angle_sun,rotate_theta);
+        rotationpoint[0][0] = cos(rotate_theta);
+        rotationpoint[0][1] = 0;
+        rotationpoint[0][2] = -sin(rotate_theta);
+        rotationpoint[1][0] = 0;
+        rotationpoint[1][1] = 1;
+        rotationpoint[1][2] = 0;
+        rotationpoint[2][0] = sin(rotate_theta);
+        rotationpoint[2][1] = 0;
+        rotationpoint[2][2] = cos(rotate_theta);
+        Rotate(rotorbit, reci1, reci1orb);
+        Rotate(rotationpoint, -reci1orb, raisevec);
+        transpose(rorbtoeci, rotorbit);
+        dotprod(posdotprod, -reci1orb, raisevec);
+        Rotate(rorbtoeci, raisevec, raisevececi);
+        //fprintf(fsunang, "%d\t%lf\n",i, acos(rotate_theta)*180/_pi);
+        fprintf(fmaggen,"%lf\t%lf\t%lf\t%lf\n",run_time/86400,Mgen[0], Mgen[1], Mgen[2]);
+
+        /*Thermal and Power calculations*/
+        /*	if((run_time/86400) > 1.00) {
+            thermal_power();
+            }
+            */
+        if(count % 10 == 0 && 1) {
+            sprintf(print_q,"%e\t%e\t%e\t%e\t%e\n",run_time, (q0[0] - q0[2])/sqrt(2), (q0[1] + q0[3])/sqrt(2), (q0[2] + q0[0])/sqrt(2), (q0[3] - q0[1])/sqrt(2));
+            rvalue = write(fq_stk,print_q,strlen(print_q));
+            if(rvalue ==-1) {
+                printf("Can't print the quaternion in dynamics\n");
+                exit(1);
+            }
+        }
+
+        /*Print x axis of satellite in ECI */
+        if(count % 50 == 0 || 1) {
+            //sprintf(printz,"%20.10e\t%20.10e\t%20.10e\n",rot[2][0],rot[2][1],rot[2][2]);
+            //fprintf(fzangles, "%lf\t%lf\t%lf\n", 180*acos(rot[2][0])/_pi, 180*acos(rot[2][1])/_pi,180*acos( rot[2][2])/_pi );
+            sprintf(printz,"%20.10e\t%20.10e\t%20.10e\n",zaxisorb[0], zaxisorb[1], zaxisorb[2]);
+            fprintf(fzaxiscomm, "%20.10e\t%20.10e\t%20.10e\n",rot[1][0], rot[1][1], rot[1][2]);
+
+            //                            fprintf(fzangles, "%lf\t%lf\t%lf\n", 180*acos(zaxisorb[0])/_pi, 180*acos(zaxisorb[1])/_pi,180*acos( zaxisorb[2])/_pi );
+            //sprintf(printz,"%20.10e\t%20.10e\t%20.10e\n",rot[1][0],rot[1][1],rot[1][2]);
+            rvalue = write(foutz,printz,strlen(printz));
+            if(rvalue ==-1) {
+                printf("Can't print the zaxis for dynamics\n");
+                exit(1);
+            }
+        }
+
+        /*Angular momentum calculations*/
+        if(1) {
+            /*here m array represents angular momentum in body frame */
+            m[0] = inertia[0][0] * w0[0] + inertia[0][1] * w0[1] + inertia[0][2] *w0[2];
+            m[1] = inertia[1][0] * w0[0] + inertia[1][1] * w0[1] + inertia[1][2] *w0[2];
+            m[2] = inertia[2][0] * w0[0] + inertia[2][1] * w0[1] + inertia[2][2] *w0[2];
+            /*Convert the angular momentum in body frame to inertial frame*/
+            /*Angular momentum is conserved only in the inertial frame not in the body frame only when the interval is less then 0.1 secs*/
+            angMomentum[0] = rot[0][0] * m[0] + rot[1][0] *m[1] + rot[2][0] *m[2];
+            angMomentum[1] = rot[0][1] * m[0] + rot[1][1] *m[1] + rot[2][1] *m[2];
+            angMomentum[2] = rot[0][2] * m[0] + rot[1][2] *m[1] + rot[2][2] *m[2];
+            //			printf("%d\t%e\t%e\t%e\n",i, angMomentum[0], angMomentum[1], angMomentum[2]);
+            /*
+               if(count % 50 == 0) {
+            //sprintf(print_string2, "%lf\t%e\t%e\t%e\n",run_time/86400.0, angMomentum[0],angMomentum[1],angMomentum[2]);
+            sprintf(print_string2, "%lf\t%e\t%e\t%e\n",run_time/86400.0, angMomentum[2],angMomentum[1],-angMomentum[0]);
+            write(fangMom, print_string2, strlen(print_string2));
+            }
+            */
+            weci[0] = rot[0][0] * w0[0] + rot[1][0] *w0[1] + rot[2][0] *w0[2];
+            weci[1] = rot[0][1] * w0[0] + rot[1][1] *w0[1] + rot[2][1] *w0[2];
+            weci[2] = rot[0][2] * w0[0] + rot[1][2] *w0[1] + rot[2][2] *w0[2];
+            //      printf("weci:%lf\t%lf\n", weci[1], weci[2]);
+            /*              if(run_time >(0.04*86400))
+                            {
+                            ecichange[0] = weci[0] * interval_sim;
+                            eciang[0] = eciang[0] + ecichange[0];
+
+                            ecichange[1] = weci[1] * interval_sim;
+                            eciang[1] = eciang[1] + ecichange[1];
+
+                            ecichange[2] = weci[2] * interval_sim;
+                            eciang[2] = eciang[2] + ecichange[2];
+                            }
+                            fprintf(feciang, "%lf\t%lf\t%lf\t%lf\n", run_time/86400, eciang[0]*180/_pi, eciang[1]*180/_pi, eciang[2]*180/_pi);*/
+        }
+
+        Rotate (rotorbit, weci, w0orb);
+        if(fabs(w0prev2[0])> fabs(w0prev[0]))
+            if(fabs(w0prev[0])<fabs(w0[0]))
+            {
+                angxcount++;
+            }
+        if(fabs(w0prev2[1])> fabs(w0prev[1]))
+            if(fabs(w0prev[1])<fabs(w0[1]))
+                angycount++;
+        if(fabs(w0prev2[2])> fabs(w0prev[2]))
+            if(fabs(w0prev[2])<fabs(w0[2]))
+                angzcount++;
+
+        w0prev2[0] = w0prev[0];
+        w0prev2[1] = w0prev[1];
+        w0prev2[2] = w0prev[2];
+        w0prev[0] = w0[0];
+        w0prev[1] = w0[1];
+        w0prev[2] = w0[2];
+        current[0] = Mgen[0]/1.84938;
+        current[1] = Mgen[1]/1.84938;
+        current[2] = Mgen[2]/1.84938;
+        pwr[0] = current[0] * current[0] * 0.5;
+        pwr[1] = current[1] * current[1] * 0.5;
+        pwr[2] = current[2] * current[2] * 0.5;
+        wheel_power = rw_angmomdot[1]*5/torq_cons;
+        energy = pwr[0] + pwr[1] + pwr[2] + pwrp[0] + wheel_power;// + pwrp[1] + pwrp[2];
+        pwrp[0] = energy;
+        fprintf(fMcurrent, "%d\t%lf\t%lf\t%lf\n", i, current[0],  current[1], current[2]);
+        if((i) >  (samples-2))
+            printf("Energy:%e\n", energy);
+
+        //		if ((int)run_time == (int)(2 * 86399))
+        //	printf("x: %lf\ty: %lf\tz: %lf\n", angxcount, angycount, angzcount);
+
+        //		Rotate (rotorbit, weci, w0orb);
+        Rotate (rotb_to_orb, w0, w0orb);
+
+        if(count % 10 == 0) {
+            //Print angular velocity in body frame
+            sprintf(print_string2, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, w0[0]*180/_pi, w0[1]*180/_pi, w0[2]*180/_pi);
+            //      sprintf(print_string2, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, w0[0]*180/_pi, w0[1]*180/_pi, w0[2]*180/_pi);
+            //              sprintf(print_string2, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, weci[0]*180/_pi, weci[1]*180/_pi, weci[2]*180/_pi);
+            //      sprintf(print_stringweci, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, weci[0]*180/_pi, weci[1]*180/_pi, weci[2]*180/_pi);
+            //sprintf(print_string2, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, w0[2]*180/_pi, w0[1]*180/_pi, -w0[0]*180/_pi);
+            //                      sprintf(print_stringweci, "%lf\t%.4lf\t%.4lf\t%.4lf\n", run_time/86400, weci[2]*180/_pi, weci[1]*180/_pi, -weci[0]*180/_pi);
+            write(fw, print_string2, strlen(print_string2));
+            //                      write(fweci, print_stringweci, strlen(print_stringweci));
+            //                      printf(" %lf\t%lf\t%lf\t%lf\n",run_time, w0[0],w0[1],w0[2]);
+        }
+
+        //magnitude = sqrt(Bearth[0]*Bearth[0] +Bearth[1]*Bearth[1] + Bearth[2]*Bearth[2]);
+        /*
+
+           PE[0] = PEm + PEh + PEr;
+           TE[0] = KE[0] + PE[0];
+        //printf("%lf\t%e\t%e\t%e\t%lf\t%e\n",run_time/5947,KE[0],PE[0],TE[0],latitude,magnitude);
+        KErateChange = 10*(11.0*KE[0]/6.0 - 3*KE[1] + 1.5*KE[2] - 1.0*KE[3]/3.0 );
+        PErateChange = 10*(11.0*PE[0]/6.0 - 3*PE[1] + 1.5*PE[2] - 1.0*PE[3]/3.0 );
+        TErateChange = 10*(11.0*TE[0]/6.0 - 3*TE[1] + 1.5*TE[2] - 1.0*TE[3]/3.0 );
+        for(k=2;k>=0;k--) {
+        KE[k+1] = KE[k];
+        PE[k+1] = PE[k];
+        TE[k+1] = TE[k];
+        }
+
+        if(i>3) {
+        if(1 && count%50 == 0) {
+        sprintf(print_string3,"%e\t%e\t%e\t%e\t%e\n",run_time/86400,KE[0],PE[0],TE[0],TErateChange);
+        rvalue = write(foutene,print_string3,strlen(print_string3));
+        if(rvalue ==-1) {
+        printf("Can't print the zaxis for dynamics\n");
+        exit(1);
+        }
+        }
+
+        }
+
+*/
+        //Roll, pitch and yaw calculations
+        rpy();
+        for(kf = 0; kf < 2*L + 1; kf++) {
+            for(j = 0; j < 4; j++) {
+                w_sigma_bias_free[kf][j] = w_sigma[kf][j] - gyrob_sigma[kf][j];
+            }
+        }
+        /*Get the rate of change of quaternion at the current step*/
+        for(kf = 0; kf < 2 * L + 1; kf++) {
+            getqdot(q_sigma[kf], w_sigma_bias_free[kf], kq1);	
+
+            /*Get the rate of change of angular velocity at the current step*/
+            getwdot(w_sigma[kf], torque, kw1);
+            getwdot(w_sigma_bias_free[kf], torque, kw1_b);
+
+            print_count++;
+
+            /*Now in the next block reinitializing all the variables related to the Runge Kutta method*/
+            /* This is the next estimate of the quaternion and the angular velocity at the midpoint of the interval*/
+            for(j = 0; j < 4; j++) {
+                param1[j] = q_sigma[kf][j] + 0.5 * kq1[j] * interval_sim;	//Quaternion estimate at midpoint of the interval
+                param2[j] = w_sigma[kf][j] + 0.5 * kw1[j] * interval_sim;	//Ang. vel. estimate at midpoint of the interval
+                param2_b[j] = w_sigma_bias_free[kf][j] + 0.5 * kw1_b[j] * interval_sim;
+
+            }
+            /*Even the estimate of the quaternion has to be normalized as only unit quaternion represents rotation matrix*/
+            /*Then the corresponding rate of change of quaternion and angular velocity is determined*/
+            magnitude = sqrt(param1[0] * param1[0] + param1[1] * param1[1] + param1[2] * param1[2] + param1[3] * param1[3]);
+            normalize(param1, magnitude);
+
+            getqdot(param1, param2_b, kq2);			//qdot(kq2) with new quaternion and ang. vel.
+
+            /*Torque has to be determined for every new estimate of quaternion */
+            findTorque(param1, torque1, 0);	//findtorque2
+
+            getwdot(param2, torque1, kw2);
+            
+            getwdot(param2_b, torque1, kw2_b);
+
+            print_count++;
+
+            for(j = 0; j < 4; j++) {
+                param1[j] = q_sigma[kf][j] + 0.5 * kq2[j] * interval_sim;//Quaternion estimate at midpoint of the interval
+                param2[j] = w_sigma[kf][j] + 0.5 * kw2[j] * interval_sim; //Ang. vel. estimate at midpoint of the interval
+                param2_b[j] = w_sigma_bias_free[kf][j] + 0.5 * kw2_b[j] * interval_sim;
+            }
+
+            /*Again normalize and find the corresponding rate of change*/
+            magnitude = sqrt(param1[0] * param1[0] + param1[1] * param1[1] + param1[2] * param1[2] + param1[3] * param1[3]);
+            normalize(param1, magnitude);
+
+            getqdot(param1, param2_b, kq3);
+
+            //Torque with new estimated quaternion
+            findTorque(param1, torque1, 0); //findTorque3
+
+            getwdot(param2, torque1, kw3);
+            getwdot(param2_b, torque1, kw3_b);
+            
+            print_count++;
+
+            for(j = 0; j < 4; j++) {
+                param1[j] = q_sigma[kf][j] + kq3[j] * interval_sim;
+                param2[j] = w_sigma[kf][j] + kw3[j] * interval_sim;
+                param2_b[j] = w_sigma_bias_free[kf][j] + kw3_b[j] * interval_sim;
+            }
+
+            /*Again normalize the quaternion and find the rates of change*/
+
+            magnitude = sqrt(param1[0] * param1[0] + param1[1] * param1[1] + param1[2] * param1[2] + param1[3] * param1[3]);
+            normalize(param1, magnitude);
+
+            getqdot(param1, param2_b, kq4);
+
+            findTorque(param1, torque1, 0); //findTorque4
+            getwdot(param2, torque1, kw4);
+            getwdot(param2_b, torque1, kw4_b);
+
+            for(j = 0; j < 4; j++) {
+                q_error[kf][j] = q_sigma[kf][j] + interval_sim * (kq1[j] + kq2[j] * 2 + 2 * kq3[j] + kq4[j]) / 6;
+                w_error[kf][j] = w_sigma[kf][j] + interval_sim * (kw1[j] + kw2[j] * 2 + 2 * kw3[j] + kw4[j]) / 6;
+                w_sigma_bias_free[kf][j] += interval_sim * (kw1_b[j] + kw2_b[j] * 2 + 2 * kw3_b[j] + kw4_b[j]) / 6;
+                q_sigma[kf][j] = q_error[kf][j];
+                w_sigma[kf][j] = w_error[kf][j];
+            }
+
+            magnitude = sqrt(q_sigma[kf][0] * q_sigma[kf][0] + q_sigma[kf][1] * q_sigma[kf][1] + q_sigma[kf][2] * q_sigma[kf][2] + q_sigma[kf][3] * q_sigma[kf][3]);
+            normalize(q_sigma[kf], magnitude);
+        }
+         
+        if(DEBUG && run_time > beg && run_time <= fin) {
+            printf("updated sigma points q_sigma w_sigma (m_sigma and gyro_sigma don't change) ---------\n");
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                for(j = 0; j < 4; j++)
+                    printf("%f ", q_sigma[kf][j]);
+                printf("\t");
+                for(j = 0; j < 3; j++)
+                    printf("%f ", w_sigma[kf][j]);
+                printf("\n");
+            }
+        }
+        count++;
+        q_predicted[0] = q_predicted[1] = q_predicted[2] = q_predicted[3] = 0;
+        w_predicted[0] = w_predicted[1] = w_predicted[2] = w_predicted[3] = 0;
+        m_predicted[0] = m_predicted[1] = m_predicted[2] = m_predicted[3] = 0;
+        gyrob_predicted[0] = gyrob_predicted[1] = gyrob_predicted[2] = gyrob_predicted[3] = 0;
+        q_error_mean[0] = q_error_mean[1] = q_error_mean[2] = q_error_mean[3] = 0;
+        w_error_mean[0] = w_error_mean[1] = w_error_mean[2] = w_error_mean[3] = 0;
+        m_error_mean[0] = m_error_mean[1] = m_error_mean[2] = m_error_mean[3] = 0;
+        gyrob_error_mean[0] = gyrob_error_mean[1] = gyrob_error_mean[2] = gyrob_error_mean[3] = 0; 
+        /*weighted mean x(k|k-1) */
+        for(j = 0; j < 4; j++) {
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                q_predicted[j] += (wm[kf / (2 * L)] * q_sigma[kf][j]);
+                w_predicted[j] += (wm[kf / (2 * L)] * w_sigma[kf][j]);
+                m_predicted[j] += (wm[kf / (2 * L)] * m_sigma[kf][j]);
+                gyrob_predicted[j] += (wm[kf / (2 * L)] * gyrob_sigma[kf][j]);
+            }
+        }
+	        
+	    magnitude = sqrt(q_predicted[0] * q_predicted[0] + q_predicted[1] * q_predicted[1] + q_predicted[2] * q_predicted[2] + q_predicted[3] * q_predicted[3]);
+        normalize(q_predicted, magnitude);
+
+        /*error calculation*/
+        for(kf = 0; kf < 2 * L + 1; kf++) {
+            qmuli(q_error[kf], q_sigma[kf], q_predicted);
+            for(j = 0; j < 4; j++){
+                w_error[kf][j] = w_sigma[kf][j] - w_predicted[j];
+                m_error[kf][j] = m_sigma[kf][j] - m_predicted[j];
+                gyrob_error[kf][j] = gyrob_sigma[kf][j] - gyrob_predicted[j];
+
+            }
+        }
+        /*q_error_mean stores mean of error quaternions*/
+        for(j = 0; j < 4; j++) {
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                q_error_mean[j] += q_error[kf][j] * wm[kf / (2 * L)];
+                w_error_mean[j] += w_error[kf][j] * wm[kf / (2 * L)];
+                m_error_mean[j] += m_error[kf][j] * wm[kf / (2 * L)];
+                gyrob_error_mean[j] += gyrob_error[kf][j] * wm[kf / (2 * L)]; 
+            }
+        }
+		
+
+        if(DEBUG  && run_time > beg && run_time <= fin) {
+            printf("sigma errors  sigma -mean(sigma)\n");
+            for(kf = 0; kf < 2 * L + 1; kf++) {
+                for(j = 0; j < 4; j++)
+                    printf("%f ", q_error[kf][j]);
+                printf("\t");
+                for(j = 0; j < 3; j++)
+                    printf("%f ", w_error[kf][j]);
+                printf("\t");
+                for(j = 0; j < 3; j++ )
+                    printf("%e ", m_error[kf][j]);
+                printf("\t");
+                for(j = 0; j < 3; j++)
+                    printf("%e ",gyrob_error[kf][j]);
+                printf("\t");
+                printf("\n");
+            }
+            printf("\n");
+        }
+
+        //if code doesn't work, try commenting following 2 lines
+        magnitude = sqrt(q_error_mean[0] * q_error_mean[0] + q_error_mean[1] * q_error_mean[1] + q_error_mean[2] * q_error_mean[2] + q_error_mean[3] * q_error_mean[3]);
+        normalize(q_error_mean, magnitude);
+
+        matrix_initialize(L,L,Pco);
+        matrix_initialize(L,L,P);
+        matrix_initialize(SV,SV,Pzz);
+        matrix_initialize(L,SV,Kk);	
+        matrix_initialize(L,SV,Pxz);
+
+        /*Calculate covariance matrix*/
+        /*Pco = P(k|k-1) = weight * (point - mean) * (point - mean)t*/
+        if(!test) {
+            for(kf = 0; kf < L; kf++) {
+                for(j = 0; j < L; j++) {
+                    Pco[kf][j] = 0;
+                    for(k = 0; k < 2 * L + 1; k++) {
+                        if(kf < 3 && j < 3)
+                            Pco[kf][j] += (q_error[k][kf] - q_error_mean[kf]) * (q_error[k][j] - q_error_mean[j]) * wc[k / (2 * L)];
+                        if((kf > 2 && kf < 6) && (j < 3))
+                            Pco[kf][j] += (w_error[k][kf-3] - w_error_mean[kf-3]) * (q_error[k][j] - q_error_mean[j]) * wc[k / (2 * L)];
+                        if((kf < 3) && (j > 2 && j < 6))
+                            Pco[kf][j] += (q_error[k][kf] - q_error_mean[kf]) * (w_error[k][j-3] - w_error_mean[j-3]) * wc[k / (2 * L)];
+                        if((kf > 2 && kf < 6) && (j > 2 && j < 6))
+                            Pco[kf][j] += (w_error[k][kf-3] - w_error_mean[kf-3]) * (w_error[k][j-3] - w_error_mean[j-3]) * wc[k / (2 * L)];
+                        if((kf > 5) && (j < 3))
+                            Pco[kf][j] += (m_error[k][kf-6] - m_error_mean[kf-6]) * (q_error[k][j] - q_error_mean[j]) * wc[k / (2 * L)]; 
+                        if((kf < 3) && (j > 5))
+                            Pco[kf][j] += (q_error[k][kf] - q_error_mean[kf]) * (m_error[k][j-6] - m_error_mean[j-6]) * wc[k / (2 * L)];
+                        if((kf > 2 && kf < 6) && (j > 5))
+                            Pco[kf][j] += (w_error[k][kf-3] - w_error_mean[kf-3]) * (m_error[k][j-6] - m_error_mean[j-6]) * wc[k / (2 * L)];
+                        if((kf > 5) && (j > 2 && j < 6))
+                            Pco[kf][j] += (m_error[k][kf-6] - m_error_mean[kf-6]) * (w_error[k][j-3] - w_error_mean[j-3]) * wc[k / (2 * L)];
+                        if((kf > 5 && kf < 9) && (j > 5 && j < 9))
+                            Pco[kf][j] += (m_error[k][kf-6] - m_error_mean[kf-6]) * (m_error[k][j-6] - m_error_mean[j-6]) * wc[k / (2 * L)];
+                        if(kf > 8 && j < 3)
+                            Pco[kf][j] += (gyrob_error[k][kf-9] - gyrob_error_mean[kf-9]) * (q_error[k][j] - q_error_mean[j]) * wc[k / (2 * L)];
+                        if(kf > 8 && (j > 2 && j < 6))
+                            Pco[kf][j] += (gyrob_error[k][kf-9] - gyrob_error_mean[kf-9]) * (w_error[k][j-3] - w_error_mean[j-3]) * wc[k / (2 * L)];
+                        if(kf > 8 && (j > 5 && j < 9))
+                            Pco[kf][j] += (gyrob_error[k][kf-9] - gyrob_error_mean[kf-9]) * (m_error[k][j-6] - m_error_mean[j-6]) * wc[k / (2 * L)];
+                        if(kf > 8 && j > 8)
+                            Pco[kf][j] += (gyrob_error[k][kf-9] - gyrob_error_mean[kf-9]) * (gyrob_error[k][j-9] - gyrob_error_mean[j-9]) * wc[k / (2 * L)]; 
+                        if(kf < 3 && j > 8)
+                            Pco[kf][j] += (q_error[k][kf] - q_error_mean[kf]) * (gyrob_error[k][j-9] - gyrob_error_mean[j-9]) * wc[k / (2 * L)];
+                        if((kf > 2 && kf < 6) && j > 8)
+                            Pco[kf][j] += (w_error[k][kf-3] - w_error_mean[kf-3]) * (gyrob_error[k][j-9] - gyrob_error_mean[j-9]) * wc[k / (2 * L)];
+                        if((kf > 5 && kf < 9) && j > 8)
+                            Pco[kf][j] += (m_error[k][kf-6] - m_error_mean[kf-6]) * (gyrob_error[k][j-9] - gyrob_error_mean[j-9]) * wc[k / (2 * L)];
+
+                    }
+                    Pco[kf][j] += Qk[kf][j];
+                }
+            }
+
+            if(DEBUG && run_time > beg && run_time <= fin) {
+
+                printf("%e %e %e %e \n",gyrob_error_mean[0],gyrob_error_mean[1],gyrob_error_mean[2],gyrob_error_mean[3]);
+                printf("gyrob_error - gyrob_error_mean ---\n");
+                for(kf = 0; kf < 2*L +1; kf++) {
+                    for(j = 0; j < 3; j++){
+                        printf("%e ", gyrob_error[kf][j] - gyrob_error_mean[j]);
+                    }
+                    printf("\n");
+                }
+                printf("\n");
+
+                printf("P(k|k-1) + Qk\n");
+                matrix_display(L,L,Pco);
+
+            }
+            fscanf(fIGRF,"%lf\t%lf\t%lf\n",&IGRF[0],&IGRF[1],&IGRF[2]);
+            // rotation of magnetic field in eci frame to body frame by the quaternion sigma points ---------
+            for(kf = 0;kf < 2*L + 1; kf++){
+                quaternion_to_matrix(q_sigma[kf],rot);
+                for(j=0;j<3;j++){
+                    z_sigma[kf][j] =0;
+                    for(k=0;k<3;k++){
+                        z_sigma[kf][j] += rot[j][k]*IGRF[k];
+                    }
+                }
+            }
+            for(kf=0;kf<2*L+1;kf++){
+                z_sigma[kf][3] = 0;
+            }
+            if(DEBUG && (run_time<=fin && run_time>beg)){
+                printf("sigma_points of the rotated magnetic field by the sigma points of quaternion \n");
+                for(kf =0;kf< 2*L+1;kf++){
+                    for(j=0;j<4;j++){
+                        printf("%e ",z_sigma[kf][j]);
+                    }
+                    printf("\n");
+                }
+                printf("\n");
+            }
+            // adding of the bias sigma points to the rotated magnetic field sigma points ----------
+            for(kf=0; kf < 2*L + 1 ; kf++){
+                for(j=0; j < 4;j++){
+                    z_sigma[kf][j] += m_sigma[kf][j];
+                }
+            }
+
+            /* sensor model */
+            zm[0] = zm[1] = zm[2] = zm[3] = zm[4] = zm[5]= 0;
+            for(kf = 0; kf < 2 * L + 1; kf++){
+                // IS THIS NEED FOR SENSOR MODEL 
+                /*
+                z[kf][0] = w_predicted[0] + gyrob_sigma[kf][0];
+                z[kf][1] = w_predicted[1] + gyrob_sigma[kf][1];
+                z[kf][2] = w_predicted[2] + gyrob_sigma[kf][2];
+                */       	 
+                z[kf][0] = w_sigma[kf][0] + gyrob_sigma[kf][0];
+                z[kf][1] = w_sigma[kf][1] + gyrob_sigma[kf][1];
+                z[kf][2] = w_sigma[kf][2] + gyrob_sigma[kf][2];
+                
+                z[kf][3] = z_sigma[kf][0];
+                z[kf][4] = z_sigma[kf][1];
+                z[kf][5] = z_sigma[kf][2];
+			
+                /*mean of predicted angular velocity measurement ----*/
+                zm[0] += z[kf][0] * wm[kf / (2 * L)];
+                zm[1] += z[kf][1] * wm[kf / (2 * L)];
+                zm[2] += z[kf][2] * wm[kf / (2 * L)];
+
+                /*mean of predicted magnetometer measurement + the bias in body frame --------*/
+                zm[3] += z[kf][3] * wm[kf / (2 * L)];
+                zm[4] += z[kf][4] * wm[kf / (2 * L)];
+                zm[5] += z[kf][5] * wm[kf / (2 * L)];	
+            }
+
+            if(DEBUG && run_time > beg && run_time <= fin){
+                printf("The predicted mesurements sigma points for the angualr velocity \n");
+                for(kf =0;kf < 2*L+1; kf++){
+                    for(j=0;j<3;j++){
+                        printf("%lf ",gyrob_sigma[kf][j]);
+                    }
+                    printf("\n");
+                }
+            }
+
+            for(kf = 0; kf < SV; kf++) {
+                for(j = 0; j < SV; j++) {
+                    for(k = 0; k < 2 * L + 1; k++) {
+                        Pzz[kf][j] += ((z[k][kf] - zm[kf]) * (z[k][j] - zm[j]) * wc[k / (2 * L)]);
+                    }
+                    Pzz[kf][j] += Rk[kf][j];
+                }
+            }
+
+            if(DEBUG && run_time > beg && run_time <= fin) {
+                printf("Pzz +  Rk\n");
+                matrix_display(SV,SV,Pzz);
+            }
+
+            for(kf = 0; kf < L; kf++) {
+                for(j = 0; j < SV; j++) {
+                    for(k = 0; k < 2 * L + 1; k++) {
+                        if(kf < 3)
+                            Pxz[kf][j] += ((q_error[k][kf] - q_error_mean[kf]) * (z[k][j] - zm[j]) * wc[k / (2 * L)]);
+                        if (kf < 6 && kf > 2) 
+                            Pxz[kf][j] += ((w_error[k][kf-3] - w_error_mean[kf-3]) * (z[k][j] - zm[j]) * wc[k / (2 * L)]);
+                        if(kf > 5 && kf < 9) 
+                            Pxz[kf][j] += ((m_error[k][kf-6] - m_error_mean[kf-6]) * (z[k][j] - zm[j]) * wc[k / (2 * L)]);
+                        if(kf > 8)
+                            Pxz[kf][j] += ((gyrob_error[k][kf-9] - gyrob_error_mean[kf-9]) * (z[k][j] - zm[j]) * wc[k / (2 * L)]);
+                    }
+                }
+            }
+            if(DEBUG && run_time > beg && run_time <= fin) {
+                printf("Pxz\n");
+                matrix_display(L,SV,Pxz);
+            }
+
+            matrix_inverse(SV,Pzzi,Pzz);
+
+            if(DEBUG && run_time > beg && run_time <= fin) {
+                printf("Pzzi\n");
+                matrix_display(SV,SV,Pzzi);
+            }
+
+            matrix_mul(L,SV,SV,Kk,Pxz,Pzzi);
+
+            if(DEBUG && run_time > beg && run_time <= fin) {
+                printf("Kk\n");
+                matrix_display(L,SV,Kk);
+            }
+        }
+        //used a variable named sensor[6] for the values coming for the sensor-------
+        fscanf(fsenvector,"%lf\t%lf\t%lf\t%lf\n", &sensor[0], &sensor[1], &sensor[2],&num);
+        fscanf(fMbody,"%lf\t%lf\t%lf\n",&sensor[3],&sensor[4],&sensor[5]);
+        update[0] = update[1] = update[2] = update[3] = update[4] = update[5] = update[6] = update[7]= update[8] = update[9]=0;
+        update[10] = update[11] = update[12] = 0;
+
+        //generating noise due to faulty sensor -----------
+        /*
+        for(kf=0;kf<3;kf++){
+           sensor[kf+3] += generate_gaussian(0,5)*1e-6;
+        }
+        
+        //generating random noise in angular velocity --------------
+        for(kf = 0;kf<3;kf++){
+           sensor[kf] += generate_gaussian(0,0.3333)*1e-2;
+        }*/
+        /*
+        for(kf = 0; kf < 3; kf++) {
+            sensor[kf] += 1e-2;
+        }
+        */ 
+        //sensor value of angular velocity is in senvector and bias is in Mbody----------
+        if(!test) {
+            for(kf = 0; kf < L; kf++) {
+                for(j = 0; j < SV; j++) {
+                    update[kf + 1] += Kk[kf][j] * (sensor[j] - zm[j]);
+                }
+            }
+        }
+
+        temp1 = sqrt(1 - magnitude1(&update[1]));
+        update[0] = update[1];
+        update[1] = update[2];
+        update[2] = update[3];
+        update[3] = temp1;
+
+
+        // NORMALIZING THE d(q) term should this be done ?	
+        magnitude = sqrt(update[0]*update[0] + update[1]*update[1] + update[2]*update[2] + update[3]*update[3]);	
+        for (j = 0; j < 4; j++) {
+            update[j] = update[j]/magnitude;	
+        }
+
+        if(DEBUG && run_time > beg && run_time <= fin) {
+            printf("values:  mean mean_error zm update new\n");
+            printf("updated quaternion --------- ");
+            for(j = 0; j < 4; j++) {
+                printf("%f ",q0[j]);
+            }
+            printf("\nupdated angular velocity -------- ");
+            for(j = 0; j < 3; j++) {
+                printf("%f ",w0[j]);
+            }
+            printf("\nupdated magnetometer bias value -------- ");
+            for(j = 0; j < 3; j++){
+                printf("%e ",bias[j]);
+            }
+            printf("\nupdated gyroscope bias vaue -------- ");
+            for(j = 0;j < 3;j++){
+                printf("%e ",gyrob[j]);
+            }
+            printf("\n");
+            printf("predicted quaternion ------ ");
+            for(j = 0; j < 4; j++) {
+                printf("%f ",q_predicted[j]);
+            }
+            printf("\npredicted angular velocity ----- ");
+            for(j = 0; j < 3; j++) {
+                printf("%f ",w_predicted[j]);
+            }
+            printf("\npredicted magneto meter bais ----- ");
+            for(j = 0; j < 3; j++){
+                printf("%e ",m_predicted[j]);	
+            }
+            printf("\npredicted gyroscope bias ----- ");
+            for(j=0;j < 3;j++){
+                printf("%e ",gyrob_predicted[j]);
+            }
+            printf("\n");
+            printf("\nq_error_mean ----");
+            for(j = 0; j < 4; j++) {
+                printf("%f ",q_error_mean[j]);
+            }
+            printf("\nw_error_mean -----");
+            for(j = 0; j < 3; j++) {
+                printf("%f ",w_error_mean[j]);
+            }
+            printf("\nm_error_mean-----");
+            for(j = 0;j < 3;j++) {
+                printf("%e ",m_error_mean[j]);
+            }
+            printf("\n");
+            printf("\npredicted measurements ----");
+            for(j = 0; j < 6; j++) {
+                printf("%f ",zm[j]);
+            }
+            printf("\n");
+            printf("correction factor --- ");
+            for(j = 0; j < 13; j++) {
+                printf("%e ",update[j]);
+            }
+            printf("\n");
+        }
+        qmul(q0, update, q_predicted);
+        magnitude = sqrt(q0[0] * q0[0] + q0[1] * q0[1] + q0[2] * q0[2] + q0[3] * q0[3]);
+        normalize(q0, magnitude);
+
+        w0[0] = w_predicted[0] + update[4];
+        w0[1] = w_predicted[1] + update[5];
+        w0[2] = w_predicted[2] + update[6];
+        w0[3] = 0;
+
+        bias[0] = m_predicted[0] + update[7];
+        bias[1] = m_predicted[1] + update[8];
+        bias[2] = m_predicted[2] + update[9];
+        bias[3] = 0;
+        
+        zm[3] = zm[3] - bias[0]; 
+        zm[4] = zm[4] - bias[1]; 
+        zm[5] = zm[5] - bias[2]; 
+
+        gyrob[0] = gyrob_predicted[0] + update[10];
+        gyrob[1] = gyrob_predicted[1] + update[11];
+        gyrob[2] = gyrob_predicted[2] + update[12];
+        gyrob[4] = 0;
+        /* 
+        w0[0] = w0[0] - gyrob[0];
+        w0[1] = w0[1] - gyrob[1];
+        w0[2] = w0[2] - gyrob[2];
+        */
+        fprintf(fsen,"%e %e %e %e %e %e\n",sensor[0],sensor[1],sensor[2],sensor[3],sensor[4],sensor[5]);
+        fprintf(ferror1,"%e %e %e %e %e %e\n",zm[0],zm[1],zm[2],zm[3],zm[4],zm[5]);
+        fprintf(fresults,"%e %e %e %e %e %e\n",bias[0],bias[1],bias[2],gyrob[0],gyrob[1],gyrob[2]);
+
+        if(DEBUG && run_time > beg && run_time <= fin) {
+            printf("kalman value  ---");
+            printf("\n quaternion ---");
+            for(j = 0; j < 4; j++) {
+                printf("%f ",q0[j]);
+            }
+            printf("\n angular velocity ---");
+            for(j = 0; j < 3; j++) {
+                printf("%f ",w0[j]);
+            }
+            printf("\n magneto meter bias ---");
+            for(j = 0; j < 3; j++ ){
+                printf("%e ",bias[j]);
+            }
+            printf("\n gyroscope bias --- ");
+            for(j =0 ;j < 3; j++){
+                printf("%e ",gyrob[j]);
+            }
+            printf("\n");
+        }
+        /*Pxz is useless now so we can use it to store temp val*/
+        if(!test) {
+            matrix_initialize(L,SV,Pxz);
+            matrix_initialize(L,L,P);
+            /* P = Kk * Pzz * (Kk)T */
+
+            matrix_mul(L,SV,SV,Pxz,Kk,Pzz);
+            matrix_transpose(L,SV,Kk_t,Kk);
+            matrix_mul(L,SV,L,P,Pxz,Kk_t);
+
+            if(DEBUG && run_time > beg && run_time <= fin) {
+                printf("KK * Pzz\n");
+                matrix_display(L,SV,Pxz);
+                printf("Kk_t\n");
+                matrix_display(SV,L,Kk_t);	
+                printf("P(k|k-1)\n");
+                matrix_display(L,L,Pco);	
+                printf("(Kk*Pzz*(Kk)T)\n");
+                matrix_display(L,L,P);
+            }
+            // UPDATE FOR P is performed at this step
+            /* P = P(k|k) = new covariance matrix for next values */
+            for(kf = 0; kf < L; kf++){
+                for(j = 0; j < L; j++){
+                    P[kf][j] = Pco[kf][j] - P[kf][j];
+                }
+            }
+        }
+        print_count =0;
+        run_time = run_time + interval_sim;
+    }
+    /*
+       close(finm);
+       close(finpos);
+       close(foutr);
+       close(foutz);
+       close(fpr);
+    //close(fmag);
+    close(fw);
+    fclose(fcap);
+    fclose(fc1);
+    close(foutene);
+    *//*
+         close(hyst1x);
+         close(hyst2x);
+         close(hyst1y);
+         close(hyst2y);
+         close(tmagnet);
+         close(atm);
+         close(grav);
+         */
+    //close(fTorque);
+    /*
+       close(fTmagnet);
+       close(fThyst1x);
+       close(fThyst2x);
+       close(fThyst1y);
+       close(fThyst2y);
+       close(fTgd);
+       close(fTatm);
+       close(fwdot);
+       */
+    //close(fq_stk);
+
+    return;
+}
+
+/*First confirm the numerical method of integration and then check for the calculation of torque */
+
+//Here the torque is both, what is required and what is provided (As on 2nd April, 2016, when we were trying to check control law).
+//Also to test reaction wheel, t_rw is required. So for that, whatever torque is calculated, it is assumed that the Y-axis component
+// of this torque is provided by reaction wheel (check the function update_rw()).
+//In future, the implementation of the findTorque() should be such that it should first calculate what is required and then how it CAN be
+// provided by the actuators by distribution of torque among them. Then, the t_rw will be the torque provided by the reaction wheel.
+void findTorque(double *q,double *torque,int change) {
+    double tMagnet[3];
+    int a;
+    double magM;
+    double Hearth;
+    //        double thyst1x[3], thyst2x[3];
+    //        double thyst1y[3], thyst2y[3];
+    double tresidual[3];
+    int j;
+    double r_eci[3],r_body[3],tgravity[3];
+    double b1b2,b2b3,b3b1;
+    double atm_torque[3];
+    double J;
+    double magbody[3];
+    /*The quaternion represents the orientation of the satellite body frame with respect to the Inertial frame */
+    /*Convert the quaternion into the corresponding rotation matrix*/
+    rot[0][0] = 1 - 2*(q[2] *q[2] + q[1]*q[1]);
+    rot[0][1] = 2 * (q[0] * q[1] + q[3] *q[2]);
+    rot[0][2] = 2 * (q[2] *q[0] - q[3]*q[1]);
+    rot[1][0] = 2 * (q[0] *q[1] - q[3] * q[2]);
+    rot[1][1] = 1 - 2*(q[0]*q[0] + q[2]*q[2]);
+    rot[1][2] = 2 * (q[1] * q[2] + q[3] *q[0]);
+    rot[2][0] = 2 * (q[2] *q[0] + q[3] *q[1]);
+    rot[2][1] = 2 * (q[1]*q[2] - q[3]*q[0]);
+    rot[2][2] = 1 - 2*(q[0]*q[0] + q[1]*q[1]);
+    //printf("%e\t%e\t%e\t%e\n",q[0],q[1],q[2],q[3]);
+    //printf("%lf\t%lf\t%lf\t%e\t%e\t%e\t%lf\t%lf\t%lf\n", rot[0][0], rot[0][1], rot[0][2], rot[1][0], rot[1][1], rot[1][2], rot[2][0], rot[2][1], rot[2][2]);
+    /*Gravity Gradient */
+
+    latitude= latitude *_pi/180;
+    longi = longi * _pi/180;
+    r_eci[0] = cos(siderealTime)*cos(latitude)* cos(longi) - sin(siderealTime)*cos(latitude)*sin(longi);
+    r_eci[1] = sin(siderealTime)*cos(latitude)* cos(longi) + cos(siderealTime)*cos(latitude)* sin(longi);
+    r_eci[2] = sin(latitude);
+    latitude = latitude*180/_pi;
+    longi = longi * 180/_pi;
+
+    Rotate(rot,r_eci,r_body);
+
+    b1b2 = r_body[0] * r_body[1];
+    b2b3 = r_body[1] * r_body[2];
+    b3b1 = r_body[2] * r_body[0];
+    /*Here the gravity gradient torques are implemented in SI units */
+    tgravity[0]=3e-9*Gme*(b2b3*(Izz-Iyy)+b3b1*Ixy-b1b2*Ixz+Iyz*(r_body[2]*r_body[2]-r_body[1]*r_body[1]))/rad/rad/rad;
+    tgravity[1]=3e-9*Gme*(b3b1*(Ixx-Izz)-b2b3*Ixy+b1b2*Iyz+Ixz*(r_body[0]*r_body[0]-r_body[2]*r_body[2]))/rad/rad/rad;
+    tgravity[2]=3e-9*Gme*(b1b2*(Iyy-Ixx)+b2b3*Ixz-b3b1*Iyz+Ixy*(r_body[1]*r_body[1]-r_body[0]*r_body[0]))/rad/rad/rad;
+
+    /*Now the magnetic field is obtained in body frame by rotation matrix*/
+    Bearth[0] = rot[0][0] *magx + rot[0][1]*magy + rot[0][2] * magz;
+    Bearth[1] = rot[1][0] *magx + rot[1][1]*magy + rot[1][2] * magz;
+    Bearth[2] = rot[2][0] *magx + rot[2][1]*magy + rot[2][2] * magz;
+    reci1b[0] = rot[0][0] *reci1[0] + rot[0][1]*reci1[1] + rot[0][2] * reci1[2];
+    reci1b[1] = rot[1][0] *reci1[0] + rot[1][1]*reci1[1] + rot[1][2] * reci1[2];
+    reci1b[2] = rot[2][0] *reci1[0] + rot[2][1]*reci1[1] + rot[2][2] * reci1[2];
+    //	if (DEBUG2 == 1)
+    //	printf("%e\t%e\n",Bprev[0], Bearth[0]);
+    MagnitudeBearth = sqrt((Bearth[0]*Bearth[0])+(Bearth[1]*Bearth[1]) + (Bearth[2] * Bearth[2]));
+    //	printf("%lf %lf %lf\n", w0[0], w0[1], w0[2]);
+    //kgain[0] = kgain[1] = kgain[2] = 0;
+    kgain[0] = 11000;
+    kgain[1] = 11000;
+    kgain[2] = 11000;
+    if (run_time < (1 * 86400))
+    {
+        //	Bdot[0] = (Bearth[0] - Bprev[0]) /interval_sim;
+        //	Bdot[1] = (Bearth[1] - Bprev[1]) /interval_sim;
+        //	Bdot[2] = (Bearth[2] - Bprev[2]) /interval_sim;
+        Cross(Bdot, w0, Bearth);
+        Mgen[0] = 1* kgain[0] * Bdot[0] /interval_sim;
+        Mgen[1] = 1* kgain[1] * Bdot[1] /interval_sim;
+        Mgen[2] = 1* kgain[2] * Bdot[2] /interval_sim;
+        //	printf("%d\n",i);
+        //	fprintf(fmaggen,"%lf\t%lf\t%lf\n",Mgen[0], Mgen[1], Mgen[2]);
+        //fprintf(fbdot, "%lf\t%lf\t%lf\n", Bdot[0] ,Bdot[1] ,Bdot[2]);
+        //	printf("%e\t%e\t%e\n", (Bearth[0] - Bprev[0]),(Bearth[1] - Bprev[1]),(Bearth[2] - Bprev[2]));
+        //	printf("%lf\t%e\t%e\n", run_time , errnadir[0], w0[0]);
+        if (w0[0] <= 0.000087 && w0[0]>= -0.000087) //|| fabs(latitude)> 75)
+            tbdot[0] = 0;
+        else
+            tbdot[0] = Mgen[1]*Bearth[2] - Mgen[2] * Bearth[1];
+        if (w0[1] <= 0.000087 && w0[1]>= -0.000087) //|| fabs(latitude)>75 )
+            tbdot[1] = 0;
+        else
+            tbdot[1] = Mgen[2]*Bearth[0] - Mgen[0] * Bearth[2];
+        if (w0[2] <= 0.000087 && w0[2]>= -0.000087) //||fabs(latitude)>75 )
+            tbdot[2] = 0;
+        else
+            tbdot[2] = Mgen[0]*Bearth[1] - Mgen[1] * Bearth[0];
+
+    }
+    else
+    {
+        tbdot[0] = 0;
+        tbdot[1] = 0;
+        tbdot[2] = 0;
+    }
+
+    // Pointing algorithm
+    Rotate(rot, vnadir, vnadirb);
+    if(run_time > (1*86400))
+    {
+        Rotate(rot, raisevececi, raisevecb);
+        //Cross(eigvec,vnadirb, pointvec);
+        Cross(eigvec, raisevecb, pointvec);
+        dotprod(dotpr, raisevecb, pointvec);
+        //dotprod(dotpr, vnadirb, pointvec);
+        mageigen = sqrt((eigvec[0] * eigvec[0]) + (eigvec[1] * eigvec[1]) + (eigvec[2] * eigvec[2]));
+        errnadir[0] = acos(dotpr) * (eigvec[0]/ mageigen);
+        errnadir[1] = acos(dotpr) * (eigvec[1]/ mageigen);
+        errnadir[2] = acos(dotpr) * (eigvec[2]/ mageigen);
+        tnadirc[0] = -1* (ktheta * errnadir[0]) - 1* (komega * w0[0]);
+        tnadirc[1] = -1* (ktheta * errnadir[1]) - 1* (komega * w0[1]);
+        tnadirc[2] = -1* (ktheta * errnadir[2]) - 1* (komega * w0[2]);
+        t_rw[1] = tnadirc[1];
+        tnadirc[1] = 0;
+        //tnadirc[1] = tnadirc[1] * 4/8;
+        //First check without the torque being added to reaction wheel
+        Cross(Mgenmt, Bearth, tnadirc);
+        Mgenmt[0] = Mgenmt[0]/(MagnitudeBearth*MagnitudeBearth);
+        Mgenmt[1] = Mgenmt[1]/(MagnitudeBearth*MagnitudeBearth);
+        Mgenmt[2] = Mgenmt[2]/(MagnitudeBearth*MagnitudeBearth);
+        if((Mgenmt[0] > 1.84938 || Mgenmt[0] < -1.84938) && fabs(Mgenmt[0]) > fabs(Mgenmt[1]) && fabs(Mgenmt[0]) > fabs(Mgenmt[2]))
+        {
+            Mgenmt[1] = Mgenmt[1] * 1.84938/fabs(Mgenmt[0]);
+            Mgenmt[2] = Mgenmt[2] * 1.84938/fabs(Mgenmt[0]);
+            if(Mgenmt[0] > 0)
+                Mgenmt[0] = 1.84938;
+            else
+                Mgenmt[0] = -1.84938;
+        }
+        if((Mgenmt[1] >  1.84938 || Mgenmt[1] < -1.84938) && fabs(Mgenmt[1]) > fabs(Mgenmt[2]) && fabs(Mgenmt[1]) > fabs(Mgenmt[0]))
+        {
+            Mgenmt[0] = Mgenmt[0] * 1.84938/fabs(Mgenmt[1]);
+            Mgenmt[2] = Mgenmt[2] * 1.84938/fabs(Mgenmt[1]);
+            if(Mgenmt[1] > 0)
+                Mgenmt[1] = 1.84938;
+            else
+                Mgenmt[1] = -1.84938;
+        }
+        if((Mgenmt[2] > 1.84938 || Mgenmt[2] < -1.84938) && fabs(Mgenmt[2]) > fabs(Mgenmt[1]) && fabs(Mgenmt[2]) > fabs(Mgenmt[0]))
+        {
+            Mgenmt[1] = Mgenmt[1] * 1.84938/fabs(Mgenmt[2]);
+            Mgenmt[0] = Mgenmt[0] * 1.84938/fabs(Mgenmt[2]);
+            if(Mgenmt[2] > 0)
+                Mgenmt[2] = 1.84938;
+            else
+                Mgenmt[2] = -1.84938;
+        }
+        Cross(tnadirmt, Mgenmt, Bearth);//the variable is called tnadirmt (tnadir magnetorquer)
+        /*tnadir[0] = tnadirc[0];
+          tnadir[1] = tnadirc[1];
+          tnadir[2] = tnadirc[2];*/
+        tnadir[0] = tnadirmt[0];
+        tnadir[1] = tnadirmt[1];
+        tnadir[2] = tnadirmt[2];
+    }
+    else
+    {
+        tnadir[0] = 0;
+        tnadir[1] = 0;
+        tnadir[2] = 0;
+    }
+    if(rw_saturated == 1)
+    {
+        t_rw[1] = 0;
+        tnadirc[0] = 0;
+        if(rw_w[1] > 0)
+            tnadirc[1] = -1e-4;
+        else
+            tnadirc[1] = 1e-4;
+        tnadirc[2] = 0;
+        Cross(Mgen, Bearth, tnadirc);
+        Mgen[0] = Mgen[0]/(MagnitudeBearth*MagnitudeBearth);
+        Mgen[1] = Mgen[1]/(MagnitudeBearth*MagnitudeBearth);
+        Mgen[2] = Mgen[2]/(MagnitudeBearth*MagnitudeBearth);
+
+        if((Mgen[0] > 1 || Mgen[0] < -1) && fabs(Mgen[0]) > fabs(Mgen[1]) && fabs(Mgen[0]) > fabs(Mgen[2]))
+        {
+            Mgen[1] = Mgen[1] * 1/fabs(Mgen[0]);
+            Mgen[2] = Mgen[2] * 1/fabs(Mgen[0]);
+            if(Mgen[0] > 0)
+                Mgen[0] = 1;
+            else
+                Mgen[0] = -1;
+        }
+        if((Mgen[1] > 1 || Mgen[1] < -1) && fabs(Mgen[1]) > fabs(Mgen[2]) && fabs(Mgen[1]) > fabs(Mgen[0]))
+        {
+            Mgen[0] = Mgen[0] * 1/fabs(Mgen[1]);
+            Mgen[2] = Mgen[2] * 1/fabs(Mgen[1]);
+            if(Mgen[1] > 0)
+                Mgen[1] = 1;
+            else
+                Mgen[1] = -1;
+        }
+        if((Mgen[2] > 1 || Mgen[2] < -1) && fabs(Mgen[2]) > fabs(Mgen[1]) && fabs(Mgen[2]) > fabs(Mgen[0]))
+        {
+            Mgen[1] = Mgen[1] * 1/fabs(Mgen[2]);
+            Mgen[0] = Mgen[0] * 1/fabs(Mgen[2]);
+            if(Mgen[2] > 0)
+                Mgen[2] = 1;
+            else
+                Mgen[2] = -1;
+        }
+
+        Cross(tnadir, Mgen, Bearth);
+        t_rw[1] = -tnadir[1];
+        if(fabs(rw_w[1])*30/_pi < 3000)
+            rw_saturated = 0;
+        //		tnadir[0] = 0;
+        //		tnadir[2] = 0;
+        //	printf("%d\tc:%lf\tactual:%lf\t%lf\t%lf\tt_rw:%lf\n", i, tnadirc[1], tnadir[0], tnadir[1], tnadir[2], t_rw[1]);
+    }
+    if(i % 5 != 0 && 0)
+    {
+        tnadir[0] = 0;
+        tnadir[1] = 0;
+        tnadir[2] = 0;
+        t_rw[1] = 0;
+    }
+    Mgen[0] = Mgenmt[0];
+    Mgen[1] = Mgenmt[2];
+    Mgen[2] = Mgenmt[1];
+    ref_vector[0] = rot[0][1] * (magy) + rot[0][2] * (magz);
+    ref_vector[1] = rot[1][1] * (magy) + rot[1][2] * (magz);
+    ref_vector[2] = rot[2][1] * (magy) + rot[2][2] * (magz);
+
+    double magnitude = sqrt( Bearth[0]*Bearth[0] + Bearth[1] * Bearth[1] + Bearth[2]*Bearth[2]);
+
+    /*Now the torque acting on the magnet*/
+    /*Cross product of M X B*/
+    /*magnet is along z axis*/
+    magM = Bmag * volMag/u0;
+
+    /*        if(print_count == 0 && 0) {
+              sprintf(printbh,"%e\t%e\t%e\t%e\n",Hearth,hprev1x[0],J,J/u0);
+              rvalue = write(fbhcurve,printbh,strlen(printbh));
+              if(rvalue ==-1) {
+              printf("Can't print the BH curve in findTorque\n");
+              exit(1);
+              }
+              }
+              if(print_count == 0) {
+    //printf("\n  %lf\t%lf\t%lf\n\n",Hearth,hprev1x[0],J,mHyst1x);
+    }
+    else{
+
+    //printf("%d. %lf\t%lf\t%lf\n",print_count,Hearth,hprev1x[0],J,mHyst1x);
+    }
+
+
+
+
+    if(print_count ==0 && count%20==0) {
+    //              printf("%e\t%e\n",hprev2[0],hprev2[1]);
+    }
+
+*/
+    double amagnitude;
+    atmospheric_torque(atm_torque);
+
+    double gmagnitude;
+    if(print_count == 0) {
+        gmagnitude = sqrt(tgravity[0]*tgravity[0] +tgravity[1]*tgravity[1] + tgravity[2]*tgravity[2]);
+    }
+    //Torque due to residual magnetic moment
+    if(ct > 900)
+        ct = 0;
+
+    if(count <= 45 * 600) {
+        tresidual[0] = mresidual1[1] * Bearth[2] - mresidual1[2] * Bearth[1];
+        tresidual[1] = -mresidual1[0] * Bearth[2] + mresidual1[2] * Bearth[0];
+        tresidual[2] = mresidual1[0] * Bearth[1] - mresidual1[1] * Bearth[0];
+
+        for(j = 0; j < 2; j++)
+            mresidual[j] = mresidual1[j];
+    }
+    else if(ct >= 100 && ct <= 900) {
+        tresidual[0] = mresidual1[1] * Bearth[2] - mresidual1[2] * Bearth[1];
+        tresidual[1] = -mresidual1[0] * Bearth[2] + mresidual1[2] * Bearth[0];
+        tresidual[2] = mresidual1[0] * Bearth[1] - mresidual1[1] * Bearth[0];
+
+        for(j = 0; j < 2; j++)
+            mresidual[j] = mresidual1[j];
+    }
+    else if(ct >= 0 && ct <100) {
+        tresidual[0] = mresidual2[1] * Bearth[2] - mresidual2[2] * Bearth[1];
+        tresidual[1] = -mresidual2[0] * Bearth[2] + mresidual2[2] * Bearth[0];
+        tresidual[2] = mresidual2[0] * Bearth[1] - mresidual2[1] * Bearth[0];
+
+        for(j = 0; j < 2; j++)
+            mresidual[j] = mresidual2[j];
+    }
+
+    ct++;
+
+    //        double try;
+
+    /*Sum of all the torques thus initializing the torque array */
+    for(j =0;j<3;j++) {
+        //      torque[j] = tMagnet[j] + thyst1x[j] + thyst2x[j] + thyst1y[j] + thyst2y[j] + tgravity[j] + atm_torque[j] + tresidual[j];
+        //torque[j] = atm_torque[j] + tgravity[j];// + tbdot[j]+ tresidual[j];
+        if(torq_flag)
+            torque[j] = atm_torque[j]+ tresidual[j]+ tbdot[j] + tnadir[j] + t_rw[j];
+        else
+            torque[j] = tbdot[j] + tnadir[j] + t_rw[j];
+        //	torque[j] = tbdot[j] + tnadir[j];
+        //	torque[j] = 0;
+        //	t_rw[j]	= tnadir[j];
+
+        //Here the torque is both, what is required and what is provided (As on 2nd April, 2016, when we were trying to check control law).
+        //Also to test reaction wheel, t_rw is required. So for that, whatever torque is calculated, it is assumed that the Y-axis component
+        // of this torque is provided by reaction wheel (check the function update_rw()).
+        //In future, the implementation of the findTorque() should be such that it should first calculate what is required and then how it CAN be
+        // provided by the actuators by distribution of torque among them. Then, the t_rw will be the torque provided by the reaction wheel.
+    }
+
+
+    if(print_count == 0 && count % 10 == 0) {
+        sprintf(print_T,"%lf\t%e\t%e\t%e\t%e\n",run_time/86400,torque[0],torque[1],torque[2],sqrt(torque[0]*torque[0] + torque[1]*torque[1] + torque[2]*torque[2]));
+        //sprintf(print_T,"%lf\t%e\t%e\t%e\t%e\n",run_time/86400,torque[2], torque[1],-torque[0],sqrt(torque[0]*torque[0] + torque[1]*torque[1] + torque[2]*torque[2]));
+        rvalue =write(fTorque,print_T,strlen(print_T));
+        if(rvalue == -1) {
+            printf("Stupid person!! Cant open a file\n");
+        }
+    }
+
+    /*        if( count % 50 == 0 && print_count == 0 && 0) {
+              sprintf(print_fTmag,"%.4lf\t%e\t%e\t%e\n",run_time/86400,tMagnet[0],tMagnet[1],tMagnet[2]);
+    //  sprintf(print_fTmag,"%.4lf\t%e\t%e\t%e\n",run_time/86400,tMagnet[2],tMagnet[1],-tMagnet[0]);
+    rvalue =write(fTmagnet,print_fTmag,strlen(print_fTmag));
+    if(rvalue == -1) {
+    printf("Stupid person!! Cant open a file\n");
+    }
+    }
+    */
+    if( count % 50 == 0 && print_count == 0 && 0) {
+        //sprintf(print_fTgd,"%lf\t%e\t%e\t%e\n",run_time/86400,tgravity[0],tgravity[1],tgravity[2]);
+        sprintf(print_fTgd,"%lf\t%e\t%e\t%e\n",run_time/86400,tgravity[2],tgravity[1],-tgravity[0]);
+        rvalue =write(fTgd,print_fTgd,strlen(print_fTgd));
+        if(rvalue == -1) {
+            printf("Stupid person!! Cant open a file\n");
+        }
+    }
+
+    if( count% 50 == 0 && print_count == 0 && 0) {
+        //sprintf(print_fTatm,"%lf\t%e\t%e\t%e\n",run_time/86400,atm_torque[0],atm_torque[1],atm_torque[2]);
+        sprintf(print_fTatm,"%lf\t%e\t%e\t%e\n",run_time/86400,atm_torque[2],atm_torque[1],-atm_torque[0]);
+        rvalue =write(fTatm,print_fTatm,strlen(print_fTatm));
+        if(rvalue == -1) {
+            printf("Stupid person!! Cant open a file\n");
+        }
+    }
+    return;
+}
+
+
+/* Gives the rate of change of angular velocity for given angular velocity and the torque acting on it*/
+void getwdot(double *w,double *torque,double *k) {
+    double m[3];
+    double hdot[3];
+
+    /*Finding the corresponding angular momentum */
+
+    Rotate(inertia,w,m);
+
+    m[0] = m[0] + rw_angmom[0];
+    m[1] = m[1] + rw_angmom[1];
+    m[2] = m[2] + rw_angmom[2];
+
+
+    /*Here find the corresponding rate of change of angular momentum using the dynamics equation */
+    hdot[0] = torque[0] - (w[1]*m[2] - m[1]*w[2]);
+    hdot[1] = torque[1] - (w[2]*m[0] - w[0]*m[2]);
+    hdot[2] = torque[2] - (w[0]*m[1] - w[1]*m[0]);
+
+
+    /*Here the corresponding rate of change of angular velocity is determined*/
+    /*Here the last component will always be a zero */
+
+    Rotate(invinertia,hdot,k);
+
+    k[3] = 0;
+}
+
+
+// macro for magnitude calculation
+// macro for eci 2 ecef converion
+// macro for rotation matrix and vector conversion
+//void thermal_power() {
+// Calculate the position of sun in eci frame (function)
+// Calculate position of satellite in eci frame
+// Calculate position of sun wrt satellite in eci frame.
+// Find parameters to determine whether it is in eclipse or not.
+// For albedo find the position of satellite wrt earth in body frame.
+// Find the corresponding normal area.
+// eclise region
+//Apply thermal equations
+// sunlit region
+// Convert the satellite to sun vector in body frame.
+// Find the corresponding angles and the normal area.
+// Apply thermal equations
+//}
+
+
+// function for sun position
+double eciSunposition(double * sunPosition ) {
+    double julianDaten,L,meanSun,eclL,rSun,epsilon;
+    L = 280.460 + 0.9856474*days/*julianDaten*/;
+    meanSun = 357.528 + 0.9856003 * days/*julianDaten*/;
+    eclL = L + 1.915* sin(meanSun*_pi/180) + 0.020 * sin(2*meanSun*_pi/180);
+    rSun = (1.00014 - 0.01671 * cos(meanSun*_pi/180) -0.00014 * cos(2*meanSun*_pi/180)) * 149.6e9;
+    //      printf("%lf\n",rSun);
+    epsilon = 23.439 - 0.0000004;
+    //Position of sun in eci frame
+    sunPosition[0] = rSun * cos(eclL*_pi/180);
+    sunPosition[1] = rSun * cos(epsilon*_pi/180)*sin(eclL * _pi/180);
+    sunPosition[2] = rSun * sin(epsilon*_pi/180)*sin(eclL * _pi/180);
+    return rSun;
+
+}
+
+void ecefsat(double *satecef) {
+    satecef[0] = rad *1e3 * cos(latitude*_pi/180) * cos(longi*_pi/180);
+    satecef[1] = rad*1e3 * cos(latitude*_pi/180) * sin(longi*_pi/180);
+    satecef[2] = rad * 1e3* sin(latitude*_pi/180);
+}
+
+double  magnitude3(double *vector) {
+    double magnitude;
+    magnitude = sqrt(vector[0]*vector[0] + vector[1]*vector[1] + vector[2]*vector[2]);
+    return magnitude;
+}
+
+double  magnitude1(double *vector) {
+    return (vector[0]*vector[0] + vector[1]*vector[1] + vector[2]*vector[2]);
+}
+
+double unitvector(double *uvector, double *vector) {
+    double magnitude;
+    magnitude = magnitude3(vector);
+    uvector[0] = vector[0]/magnitude;
+    uvector[1] = vector[1]/magnitude;
+    uvector[2] = vector[2]/magnitude;
+    return magnitude;
+}
+
+
+void ads_triad() {
+    double satecef[3], sateci[3];
+    double sunpos[3],satisun[3],satbsun[3];
+    double magb[3], magi[3];
+    double t1b[3], t2b[3], t3b[3];
+    double t1i[3], t2i[3], t3i[3];
+    double rot_bt[3][3], rot_ti[3][3], rot_ads[3][3], error_ads;
+    double meas_err, dif;
+    int i,j;
+
+    meas_err = 0.0000002;
+    //      magb[0] = Bearth[0];
+    //      magb[1] = Bearth[1];
+    //      magb[2] = Bearth[2];
+    magi[0] = magx + meas_err;
+    magi[1] = magy - meas_err;
+    magi[2] = magz + meas_err;
+
+    unitvector(magb, Bearth);                       //Unit vector of Magnetic field in Body frame
+    unitvector(magi, magi);                         //Unit vector of magnetic field in ECI frame
+
+    eciSunposition(sunpos);                         //Position of sun in ECI frame
+
+    ecefsat(satecef);
+    eceftoeci(sateci,satecef,siderealTime);         //sateci: Position of satellite in ECI frame
+
+    /*------Calculating sun vector in ECI frame------------*/
+    satisun[0] = sateci[0] - sunpos[0] + meas_err + 0.000009;
+    satisun[1] = sateci[1] - sunpos[1] - meas_err + 0.000001;
+    satisun[2] = sateci[2] - sunpos[2] + meas_err - 0.000002;
+
+    /*------Calculating sun vector in body frame------------*/
+    Rotate(rot, satisun, satbsun);
+    unitvector(satisun, satisun);
+    unitvector(satbsun, satbsun);
+
+    /*------Considering Sun Sensor to be accurate than magnetometer and calculating intermediate triads------------*/
+
+    t1b[0] = satbsun[0];
+    t1b[1] = satbsun[1];
+    t1b[2] = satbsun[2];
+
+    t1i[0] = satisun[0];
+    t1i[1] = satisun[1];
+    t1i[2] = satisun[2];
+
+    Cross(t2b, satbsun, magb);
+    //      printvec(t2b);
+    unitvector(t2b, t2b);
+    //      printf("unit:");
+    //      printvec(t2b);
+
+    Cross(t2i, satisun, magi);
+    unitvector(t2i, t2i);
+
+    Cross(t3b, t1b, t2b);
+    //      unitvector(t3b, t3b);
+
+    Cross(t3i, t1i, t2i);
+    //      unitvector(t3i, t3i);
+
+    rot_ti[0][0] = t1i[0];
+    rot_ti[0][1] = t1i[1];
+    rot_ti[0][2] = t1i[2];
+    rot_ti[1][0] = t2i[0];
+    rot_ti[1][1] = t2i[1];
+    rot_ti[1][2] = t2i[2];
+    rot_ti[2][0] = t3i[0];
+    rot_ti[2][1] = t3i[1];
+    rot_ti[2][2] = t3i[2];
+
+    rot_bt[0][0] = t1b[0];
+    rot_bt[0][1] = t2b[0];
+    rot_bt[0][2] = t3b[0];
+    rot_bt[1][0] = t1b[1];
+    rot_bt[1][1] = t2b[1];
+    rot_bt[1][2] = t3b[1];
+    rot_bt[2][0] = t1b[2];
+    rot_bt[2][1] = t2b[2];
+    rot_bt[2][2] = t3b[2];
+
+    /*--------------Calculating the rotation matrix------------------*/
+
+    rot_ads[0][0] = rot_bt[0][0]*rot_ti[0][0] + rot_bt[0][1]*rot_ti[1][0] + rot_bt[0][2]*rot_ti[2][0];
+    rot_ads[0][1] = rot_bt[0][0]*rot_ti[0][1] + rot_bt[0][1]*rot_ti[1][1] + rot_bt[0][2]*rot_ti[2][1];
+    rot_ads[0][2] = rot_bt[0][0]*rot_ti[0][2] + rot_bt[0][1]*rot_ti[1][2] + rot_bt[0][2]*rot_ti[2][2];
+    rot_ads[1][0] = rot_bt[1][0]*rot_ti[0][0] + rot_bt[1][1]*rot_ti[1][0] + rot_bt[1][2]*rot_ti[2][0];
+    rot_ads[1][1] = rot_bt[1][0]*rot_ti[0][1] + rot_bt[1][1]*rot_ti[1][1] + rot_bt[1][2]*rot_ti[2][1];
+    rot_ads[1][2] = rot_bt[1][0]*rot_ti[0][2] + rot_bt[1][1]*rot_ti[1][2] + rot_bt[1][2]*rot_ti[2][2];
+    rot_ads[2][0] = rot_bt[2][0]*rot_ti[0][0] + rot_bt[2][1]*rot_ti[1][0] + rot_bt[2][2]*rot_ti[2][0];
+    rot_ads[2][1] = rot_bt[2][0]*rot_ti[0][1] + rot_bt[2][1]*rot_ti[1][1] + rot_bt[2][2]*rot_ti[2][1];
+    rot_ads[2][2] = rot_bt[2][0]*rot_ti[0][2] + rot_bt[2][1]*rot_ti[1][2] + rot_bt[2][2]*rot_ti[2][2];
+
+    /*----------Calculating Maximum error in 'rot' and 'rot_ads'---------------*/
+    error_ads = abs(rot[0][0] - rot_ads[0][0]);
+    for(i=0; i<2; i++)
+        for(j=0;j<2;j++) {
+
+            //              printf("%lf\t", rot_ads[i][j]);
+            //              printf("%lf\n", rot[i][j]);
+            dif = rot[i][j] - rot_ads[i][j];
+            if(fabs(dif) > error_ads)
+                error_ads = fabs(rot[i][j] - rot_ads[i][j]);
+        }
+    //  printf("%lf\n", error_ads);
+}
+void thermal_power() {
+    //	if ((int)(run_time/5862.02) == 1)
+    //	return 0;
+    double julianDaten,L,meanSun,eclL,rSun,epsilon;
+    //      double rSun;
+    double period = 90*60;
+    double semiaxis = cbrt(Gme*pow(period/_pi,2)/4);
+    double sunPosition[3],Sunecef[3];
+    double satecef[3],thetae,satsun[3],satisun[3],satbsun[3],sati[3],satb[3];
+    double theta[6],normalArea,previousR,currentR,previousT,currentT,mass = 750,c = 1.1,theta1[6],normalArea1;
+    int down = 0;
+    double emissivity = 0.79;
+    double sigma = 5.6e-8;
+    double abstheta ;
+    double diaSun = 6.955e8,de = 2*Re,distPoint,unitSun[3],satPoint[3],magSatPoint,cone,phi;
+    previousT = 273;
+    previousR = 1414 * 0.01 - sigma* emissivity*0.06*  pow(previousT,4);
+    double magss;
+
+
+    /* Power variables */
+    int pcount =0;
+    double Ptotal[6],Palbedo[6],Psun[6];
+    double P1,P2,P3,Pmax;
+    double theta2[6];
+
+
+
+    // Calculate the position of sun in eci frame (function)
+    rSun = eciSunposition(sunPosition);
+    abstheta= _pi/2.0  +  acos(Re/rad/1e3);
+    // Calculate position of satellite in eci frame
+    ecefsat(satecef);
+    eceftoeci(sati,satecef,siderealTime);
+    // Calculate position of sun wrt satellite in eci frame.
+    satisun[0] = sunPosition[0] - sati[0];
+    satisun[1] = sunPosition[1] - sati[1];
+    satisun[2] = sunPosition[2] - sati[2];
+
+
+    if(count % 600 == 0 && 0) {
+        sprintf(print_struct,"%lf\t%lf\t%lf\t%lf\t%lf\t%lf\t%lf\t%lf\n",run_time, satisun[0] * 1e3, satisun[1] * 1e3, satisun[2] * 1e3, sati[0] * 1e3, sati[1] * 1e3, sati[1] * 1e3 ,(rad*1e3 - 6378137) * 1e3);
+        rvalue = write(f_struct,print_struct,strlen(print_struct));
+        if(rvalue ==-1) {
+            printf("Can't print the satsun and satearth for dynamics\n");
+            exit(1);
+        }
+    }
+
+
+    distPoint = de*rSun/(diaSun-de);
+    //              printf("distPoint : %lf\n",distPoint);
+    rSun = unitvector(unitSun,sunPosition);
+
+    satPoint[0] = sati[0] + distPoint * unitSun[0];
+    satPoint[1] = sati[1] + distPoint * unitSun[1];
+    satPoint[2] = sati[2] + distPoint * unitSun[2];
+    //              printf("u : %lf\t%lf\t%lf\n",satPoint[0],satPoint[1],satPoint[2]);
+
+    //magSatPoint = magnitude3(satPoint);
+    magSatPoint = sqrt(satPoint[0]* satPoint[0] +satPoint[1]* satPoint[1] +satPoint[2]* satPoint[2] );
+    //printf("%.17e\n",magSatPoint);
+    //magSatPoint = magnitude3(satPoint);
+    magSatPoint = sqrt(satPoint[0]* satPoint[0] +satPoint[1]* satPoint[1] +satPoint[2]* satPoint[2] );
+    //printf("%.17e\n",magSatPoint);
+
+    phi = atan(de/2/distPoint);
+    cone = acos((satPoint[0] * unitSun[0] + satPoint[1] * unitSun[1] +  satPoint[2] * unitSun[2])/magSatPoint);
+    //              printf("%lf\t%lf\n",cone*180/pi,phi*180/pi);
+    //printf("%lf\t%lf\t%lf\n",satisun[0],satisun[1],satisun[2]);
+    //printf("%lf\t%lf\t%lf\n",sunPosition[0]-sati[0],sunPosition[1]-sati[1],sunPosition[2]-sati[2]);
+    magss = magnitude3(satisun);
+    //magss = sqrt(satisun[0]*satisun[0] + satisun[1]*satisun[1]+satisun[2]*satisun[2]);
+    //printf("%.17e\n",magss);
+    //              thetae = acos((sunPosition[0]*sati[0] + sunPosition[1]*sati[1] + sunPosition[2]*sati[2])/rad/1e3/rSun);
+    //if(count%100 == 0)
+    //printf("%lf\t%lf\t%lf\n",satisun[0]/magss,satisun[1]/magss,satisun[2]/magss);
+
+    //printf("%lf\t%lf\n",thetae*180/pi,abstheta*180/pi);
+    if(cone <= phi && magss > rSun) {
+        //                     printf("Eclipse\n");
+        Eclipsecount++;
+        /*satb[0] = rot[0][0] *sati[0] + rot[0][1]*sati[1] + rot[0][2] * sati[2];
+          satb[1] = rot[1][0] *sati[0] + rot[1][1]* sati[1] + rot[1][2] * sati[2];
+          satb[2] = rot[2][0] *sati[0] + rot[2][1]*sati[1] + rot[2][2] * sati[2];*/
+        Rotate(rot,sati,satb);
+        //printf("Reference vector %lf\t%lf\t%lf\n",satb[0],satb[1],satb[2]);
+        //printf("Magnitude: %lf\n",rad*1e3);
+        theta[0] = acos(-satb[0]/rad/1e3);
+        theta[1] = acos(-satb[1]/rad/1e3);
+        theta[2] = acos(-satb[2]/rad/1e3);
+        theta[3] = _pi - theta[0];
+        theta[4] = _pi - theta[1];
+        theta[5] = _pi - theta[2];
+        //	fprintf(fpwrang,"%lf\t%lf\t%lf\t%lf\tE\n",run_time/5862, theta[0]*180/_pi, theta[1]*180/_pi, theta[2]*180/_pi);
+        fprintf(fpwrang,"%lf\t%lf\tE\n",run_time/5862, 0.0);
+        normalArea = 0;
+        for(down = 0;down<6;down++) {
+            if(theta[down]<_pi/2) {
+                normalArea = normalArea + cos(theta[down]);
+            }
+        }
+        normalArea = normalArea * 0.01;
+        //normalArea = 0.01*1.732;
+        //printf("Normal Area: %lf\n",normalArea);
+        currentT =  (previousR*interval_sim/mass/c) + previousT;
+        //printf("Current Temperature : %lf\n",currentT);
+        currentR = 237* normalArea- sigma*0.06*emissivity*  pow(currentT,4);
+        //printf("Current R: %lf\n",currentR);
+        previousR = currentR;
+        previousT = currentT;
+        //      printf("%lf\n",normalArea);
+        //        fprintf(thermalp,"%lf\t%lf\t%lf\n",run_time,currentR,currentT);
+        if(previousR > 0) {
+            //                              printf("Stabilized\n");
+        }
+        capacity(satecef, theta, 1);
+
+    }
+    else{
+        //  printf("Daylight\n");
+        Daycount++;
+        Rotate(rot,satisun,satbsun);
+        //printf("Reference vector %lf\t%lf\t%lf\n",satbsun[0],satbsun[1],satbsun[2]);
+        //printf("Magnitude: %lf\n",magss);
+        theta[0] = acos(satbsun[0]/magss);
+        theta[1] = acos(satbsun[1]/magss);
+        theta[2] = acos(satbsun[2]/magss);
+        theta[3] = _pi - theta[0];
+        theta[4] = _pi - theta[1];
+        theta[5] = _pi - theta[2];
+        normalArea = 0;
+        for(down = 0;down<6;down++) {
+            if(theta[down]<_pi/2) {
+                normalArea = normalArea + cos(theta[down]);
+            }
+        }
+        normalArea = normalArea * 0.01;
+        fprintf(fpwrang,"%lf\t%lf\tS\n",run_time/5862, theta[2]*180/_pi);
+        Rotate(rot,sati,satb);
+        //printf("Reference vector %lf\t%lf\t%lf\n",satb[0],satb[1],satb[2]);
+        //printf("Magnitude: %lf\n",rad*1e3);
+        theta1[0] = acos(-satb[0]/rad/1e3);
+        theta1[1] = acos(-satb[1]/rad/1e3);
+        theta1[2] = acos(-satb[2]/rad/1e3);
+        theta1[3] = _pi - theta1[0];
+        theta1[4] = _pi - theta1[1];
+        theta1[5] = _pi - theta1[2];
+        normalArea1 = 0;
+        for(down = 0;down<6;down++) {
+            if(theta1[down]<_pi/2) {
+                normalArea1 = normalArea1 + cos(theta1[down]);
+            }
+        }
+
+        normalArea1 = normalArea1 * 0.01;
+        //normalArea = 1.732*0.01;
+        //normalArea1 = 1.732*0.01;
+        //printf("Normal Area: %lf\n",normalArea);
+        currentT =  (previousR*interval_sim/mass/c) + previousT;
+        //printf("Current Temperature : %lf\n",currentT);
+        currentR = 1356* normalArea + (237+425)*normalArea1 - sigma*0.06*emissivity * pow(currentT,4);
+        //printf("Current R: %lf\n",currentR);
+
+        //                      printf("%lf\n",normalArea);
+        //                      printf("%lf\n",normalArea1);
+        previousR = currentR;
+        previousT = currentT;
+        //printf("%lf\t%lf\t%lf\n",run_time,currentR,currentT);
+        if(previousR < 0) {
+            //                              printf("Stabilized\n");
+        }
+        /*  Power Analysis  */
+        //if(i>= 864000 && i<= 1728000) {
+        for( down=0;down<6;down++) {
+            if(theta[down]<_pi/2)
+                Psun[down] = 1356*0.007*0.26*cos(theta[down]);
+            else
+                Psun[down] = 0;
+
+            //              if(theta1[down]<_pi/2)
+            //                      Palbedo[down] = 425*0.007*0.26*cos(theta1[down]);
+            //              else
+            Palbedo[down] = 0;
+
+            Ptotal[down] = Psun[down] + Palbedo[down];
+            Pgrand[down] = Pgrand[down] + Ptotal[down];
+            //printf("%lf\n",Pgrand[down]);
+            //printf("%lf\n",Ptotal[down]);
+        }
+        //      }
+        /*0.007 is area of each face of solar panels, 11356 is sun intensity, 425 is Albedo intensity, 0.26 is efficiency of solar panels*/
+        if(Ptotal[0] > Ptotal[3])
+            P1 = Ptotal[0];
+        else
+            P1 = Ptotal[3];
+
+        if(Ptotal[1] > Ptotal[4])
+            P2 = Ptotal[1];
+        else
+            P2 = Ptotal[4];
+        if(Ptotal[2] > Ptotal[5])
+            P3 = Ptotal[2];
+        else
+            P3 = Ptotal[5];
+
+
+        Pmax = sqrt(P1 * P1 + P2 * P2 + P3 * P3);
+        theta2[0] = acos(P1 / Pmax);
+        theta2[1] = acos(P2 / Pmax);
+        theta2[2] = acos(P3 / Pmax);
+
+        //printf("%lf\t%lf\t%lf\n",P1/Pmax,P2/Pmax,P3/Pmax);
+        //printf("%lf\t%lf\t%lf\t%lf\t%lf\t%lf\n",Ptotal[0], Ptotal[1], Ptotal[2], Ptotal[3], Ptotal[4], Ptotal[5]);
+        //printf("%lf\t%lf\t%lf\n", P1, P2, P3);
+
+        //printf("%lf\t%lf\t\t%lf\t%lf\t\t%lf\t%lf\n", theta[0]*180/pi, theta2[0]*180/pi, theta[1]*180/pi, theta2[1]*180/pi, theta[2]*180/pi, theta2[2]*180/pi);
+        if(i==samples-1 && 0) {
+            /*Total power generated by each faces and percentage of contribution of each face*/
+            //	printf("%lf\t%lf\n",Daycount,Eclipsecount);
+            //pcount++;
+            printf("Percentage of Daylight eclipse: %lf\n",Daycount*100/(Eclipsecount+Daycount));
+            //	printf("%d\n",pcount);
+            printf("Power on each face:\n%lf\t%lf\t%lf\t%lf\t%lf\t%lf\n\n", Pgrand[0], Pgrand[1], Pgrand[2], Pgrand[3], Pgrand[4], Pgrand[5]);
+            double Facetotal = 0;
+            int k;
+            for( k = 0; k < 6; k++) {
+                Facetotal  = Facetotal + Pgrand[k];
+            }
+            printf("Total power:%lf\n",Facetotal);
+
+            printf("Percentage contribution of each face:\n%lf\t%lf\t%lf\t%lf\t%lf\t%lf\n\n\n", Pgrand[0]/Facetotal*100, Pgrand[1]/Facetotal*100, Pgrand[2]/Facetotal*100, Pgrand[3]/Facetotal*100, Pgrand[4]/Facetotal*100, Pgrand[5]/Facetotal*100);
+        }
+
+        capacity(satecef, theta, 0);
+    }
+
+
+
+
+    // Find parameters to determine whether it is in eclipse or not.
+    // For albedo find the position of satellite wrt earth in body frame.
+    // Find the corresponding normal area.
+    // eclise region
+    //Apply thermal equations
+    // sunlit region
+    // Convert the satellite to sun vector in body frame.
+    // Find the corresponding angles and the normal area.
+    // Apply thermal equations
+
+}
+
+
+void rpy() {
+    double diff, pos;
+    char print_strdynrpy[100],print_string2[100];
+    double roll,pitch,yaw,ax;
+    double eci[3],rbody[3],ecef[3],rb[3],orbith[3],orbithb[3] , aeci[3];
+    double reci[3], uorbith[3],magnitude;
+    int rvalue = 1;
+    double newrefrot[3][3];
+
+    double magorbital[3], mag_roll, mag_pitch;
+
+    ecefsat(ecef);
+    ecef[0] = ecef[0]/1e3;
+    ecef[1] = ecef[1]/1e3;
+    ecef[2] = ecef[2]/1e3;
+    //	printf("ECF %lf\t%lf\t%lf\n",ecef[0],ecef[1],ecef[2]);
+
+    eceftoeci(eci,ecef,siderealTime);
+
+
+    magnitude = unitvector(reci,eci);
+
+    //	printf("%lf\t%lf\t%lf\t%lf\n", time/5947, -reci[0], -reci[1], -reci[2]);
+    orbith[0] = eci[1] * zvel - eci[2] * yvel;
+    orbith[1] = - eci[0] * zvel + eci[2] * xvel;
+    orbith[2] =  eci[0] * yvel - eci[1] * xvel;
+    magnitude = unitvector(uorbith,orbith);
+    //	printf("yeci\t%lf\t%lf\t%lf\n", rot[1][0], rot[1][1], rot[1][2]);
+    //	printf("-h %lf\t%lf\t%lf\n",-uorbith[0], -uorbith[1], -uorbith[2]);
+    aeci[0] = (uorbith[1]*reci[2]-uorbith[2]*reci[1]);
+    aeci[1] = (-uorbith[0]*reci[2] + uorbith[2]*reci[0]);
+    aeci[2] = (uorbith[0]*reci[1] - uorbith[1]*reci[0]);
+    //	printf("%lf\t%lf\t%lf\t%lf\n", time/5947, aeci[0], aeci[1], aeci[2]);
+    //	printf("aeci %lf\t%lf\t%lf\n", rb[0], rb[1], rb[2]);
+    //reci is nadir, orbith is angular momentum vector of orbit, aeci is the third vector completing the system
+    //These vectors are the components of the rot matrix and use them to create a rotation matrix in every iteration
+
+    newrefrot[0][0] = rot[2][0];
+    newrefrot[0][1] = rot[2][1];
+    newrefrot[0][2] = rot[2][2];
+    newrefrot[1][0] = rot[1][0];
+    newrefrot[1][1] = rot[1][1];
+    newrefrot[1][2] = rot[1][2];
+    newrefrot[2][0] = -rot[0][0];
+    newrefrot[2][1] = -rot[0][1];
+    newrefrot[2][2] = -rot[0][2];
+
+    Rotate(rot,uorbith,orbithb);
+    //Rotate(newrefrot,uorbith,orbithb);
+
+    //orbithb[0] = -orbithb[0];
+    //orbithb[1] = -orbithb[1];
+    //orbithb[2] = -orbithb[2];
+
+    if(0) {
+        double zeci[3];
+        zeci[0] = newrefrot[2][0];
+        zeci[1] = newrefrot[2][1];
+        zeci[2] = newrefrot[2][2];
+        //	printf("%lf\t", time/5947);
+        //	printf("%lf\t%lf\t%lf\t", rot[0][0]-rb[0], rot[0][1]-rb[1], rot[0][2]-rb[2]);
+        //	printf("%lf\t%lf\t%lf\t", rot[1][0]+uorbith[0], rot[1][1]+uorbith[1], rot[1][2]+uorbith[2]);
+        //	printf("%lf\t%lf\t%lf\n", zeci[0]+reci[0], zeci[1]+reci[1], zeci[2]+reci[2]);
+        //	printf("%lf\t", acos(rot[0][0]*aeci[0] + rot[0][1]*aeci[1] + rot[0][2]*aeci[2])*180/_pi);
+        //	printf("%lf\n", acos(-rot[1][0]*uorbith[0] - rot[1][1]*uorbith[1] - rot[1][2]*uorbith[2])*180/_pi);
+        //	printf("%lf\n", acos(-zeci[0]*reci[0] - zeci[1]*reci[1] - zeci[2]*reci[2])*180/_pi);
+    }
+    magnitude = sqrt(eci[0]*eci[0] + eci[1]*eci[1] + eci[2]*eci[2]);
+    //	printf("R %lf\t%lf\t%lf\n",eci[0]/magnitude,eci[1]/magnitude,eci[2]/magnitude);
+
+    Rotate(rot,eci,rbody);
+    //Rotate(newrefrot,eci,rbody);
+
+    rbody[0] = -rbody[0];
+    rbody[1] = -rbody[1];
+    rbody[2] = -rbody[2];
+
+    //	printf("RBODY %lf\t%lf\t%lf\n",rbody[0],rbody[1],rbody[2]);
+    magnitude = unitvector(rbody,rbody);
+    //	printf("RBODY %lf\t%lf\t%lf\t%lf\n",time/5947,rbody[0],rbody[1],rbody[2]);
+    //	printf("Angular momentum in body frame %lf\t%lf\t%lf\n",orbithb[0],orbithb[1],orbithb[2]);
+    magnitude = unitvector(orbithb,orbithb);
+    //	printf("%lf\t%lf\t%lf\t%lf\t", time/5947, orbithb[0],orbithb[1],orbithb[2]);
+    rb[0] = (orbithb[1]*rbody[2] - orbithb[2]*rbody[1]);
+    rb[1] = (-orbithb[0]*rbody[2] + orbithb[2]*rbody[0]);
+    rb[2] = (orbithb[0]*rbody[1] - orbithb[1]*rbody[0]);
+    /*
+    //	if((samples % 100) == 0 )
+    //	printf("Angular momentum in body frame %lf\t%lf\t%lf\n",orbithb[0],orbithb[1],orbithb[2]);
+    rb[0] = Bearth[0];
+    rb[1] = Bearth[1];
+    rb[2] = Bearth[2];
+    magnitude = unitvector(rb,rb);
+    orbithb[0] = rb[1]*ref_vector[2] - rb[2]*ref_vector[1];
+    orbithb[1] = -rb[0]*ref_vector[2] + rb[2]*ref_vector[0];
+    orbithb[2] = rb[0]*ref_vector[1] - rb[1]*ref_vector[0];
+    unitvector(orbithb, orbithb);
+    rbody[0] = rb[1]*orbithb[2] - rb[2]*orbithb[1];
+    rbody[1] = -rb[0]*orbithb[2] + rb[2]*orbithb[0];
+    rbody[2] = rb[0]*orbithb[1] - rb[1]*orbithb[0];
+    unitvector(rbody,rbody);
+    //	printf("%lf\t%lf\n", time/5947, acos(rbody[2])*180/_pi);
+    //	printf("%lf\t%lf\t%lf\t%lf\n", time/5947, rb[0],rb[1],rb[2]);
+    //	printf("%lf\t%lf\t%lf\t%lf\t%lf\n", time*4/5947, rbody[0], sin(_pi/2+pitch), cos(pitch+_pi), cos(pitch));
+    //	printf("%lf\t%lf\n", time/5947, roll*180/_pi);*/
+
+    /* for 1-2-3 rotation*/
+    pitch = asin(rb[2]);
+    roll = atan2(-orbithb[2]/cos(pitch),rbody[2]/cos(pitch));
+    yaw = atan2(-rb[1]/cos(pitch), rb[0]/cos(pitch));
+    pos = cos(pitch)*cos(yaw);
+    diff = acos(pos);
+    if(roll < 0.000000 && 0)
+        roll += 2*_pi;
+    if(yaw < 0.00000)
+        yaw += 2*_pi;
+
+
+    if(count % 50 == 0) {
+
+        sprintf(print_strdynrpy,"%lf\t%e\t%e\t%e\t%e\n",run_time/86400,roll * 180/_pi, - pitch*180/_pi,yaw*180/_pi, diff*180/_pi);
+        rvalue =write(fpr,print_strdynrpy,strlen(print_strdynrpy));
+        if(rvalue == -1) {
+            close(fpr);
+            fpr = open(rpyname,  O_APPEND|O_LARGEFILE, S_IRWXU| S_IRWXO );
+            if(fpr == -1) {
+                printf("Stupid person!! Can't open a file\n");
+                exit(1);
+            }
+        }
+
+
+        magorbital[0] = Bearth[0]*rb[0] + Bearth[1]*rb[1] + Bearth[2]*rb[2];
+        magorbital[1] = Bearth[0]*orbithb[0] + Bearth[1]*orbithb[1] + Bearth[2]*orbithb[2];
+        magorbital[2] = Bearth[0]*rbody[0] + Bearth[1]*rbody[1] + Bearth[2]*rbody[2];
+        magnitude = unitvector(magorbital,magorbital);
+        mag_pitch = asin(magorbital[0]);
+        mag_roll = atan2(-magorbital[1]/cos(mag_pitch), magorbital[2]/cos(mag_pitch));
+        if(mag_roll < 0.00000)
+            mag_roll += 2*_pi;
+        /*
+           if(1) {
+           sprintf(print_string2, "%lf\t%lf\t%lf\t%lf\t%lf\n", time/5862.02, mag_roll*180/_pi, (mag_roll-roll)*180/_pi, mag_pitch*180/_pi, (mag_pitch-pitch)*180/_pi);
+           rvalue = write(fmag, print_string2, strlen(print_string2));
+           if(rvalue == -1) {
+           printf("Stupid person! Can't open a file\n");
+           exit(1);
+           }
+           }
+           */
+    }
+
+
+
+}
+
+double torqueError(double a[3], double b[3])
+{
+    double error, errorvec[3];
+    errorvec[0] = (a[0] - b[0]) * (a[0] - b[0]);
+    errorvec[1] = (a[1] - b[1]) * (a[1] - b[1]);
+    errorvec[2] = (a[2] - b[2]) * (a[2] - b[2]);
+    error = errorvec[0] + errorvec[1] +errorvec[2];
+    return sqrt(error);
+}
+double current6=0;
+void capacity(double *satecef, double *theta, int eclipse) {
+    double gs[3] = {1682029, 5811004, 2014028};
+    double satwrtgs[3], prod, current1, current2 = 0, current3 = 0, current4 = 0, current5;
+    int j;
+    for(j = 0; j < 3; j++)
+        satwrtgs[j] = satecef[j] - gs[j];
+    dotprod(prod, satwrtgs, gs);
+    /*continuous current*/
+    current1 = contcurrent * interval_sim;
+    /*communication*/
+    if(prod > 0)
+        current2 = commcurrent * interval_sim;
+    /*solar panel*/
+    if(eclipse == 0) {
+        if(run_time < 1 * 86400) {
+            for(j = 0; j < 5; j++)
+                if(theta[j] < _pi / 2 && j != 2 && cos(theta[j]) > mincos)
+                    current3 = peakcurrent * cos(theta[j]) * efficiency * interval_sim / 4;
+        }
+        else {
+            if(theta[5] < _pi / 2 && cos(theta[5]) > mincos)
+                current3 = peakcurrent * cos(theta[5]) * efficiency * interval_sim;
+        }
+    }
+    /*beacon current*/
+    if(i % 900 < 100)
+        current4 = beaconcurrent * interval_sim;
+    if(i % 10 == 0 && run_time > 86400*2 && run_time < 86400*3) {
+        if(theta[5] < _pi / 2)
+            fprintf(fc1,"%lf\t%lf\n",run_time / 86400, cos(theta[5]));
+        else 
+            fprintf(fc1,"%lf\t0.0000\n",run_time / 86400);
+    }
+    current6 += (current3 * .1);
+    current1 =  current3 - current1 - current2 - current4;
+
+    if(current1 + Tcurrent > maxcapacity)
+        Tcurrent = maxcapacity;
+    else if(current1 + Tcurrent < 0) {
+        Tcurrent = 0;
+        /*			torque[0] = 0;
+                    torque[1] = 0;
+                    torque[2] = 0;
+                    */		}
+    else
+        Tcurrent += current1;
+    current5 = ((fabs(wheel_power / 5) + fabs(current[1]) +fabs( current[2]) + fabs(current[0])) * interval_sim);
+
+    Tcurrent -= current5;
+
+    fprintf(fcap,"%lf\t%lf\t%lf\t%lf\t\n", run_time / 86400, current5, Tcurrent / 60 / 60,current6);
+
+}
+

@@ -1,0 +1,892 @@
+/*Atmospheric drag code implemented on 07/07/12*/
+#include "header.h"
+#include "tools.h"
+#include "dynamics.h"
+void atmospheric_torque(double *torque) {
+	double f[3], vmagnitude;	// f is the magnitude of drag in 1 dimension
+	int i;
+	//all other constants like density,cd, cp_cm, surface_area are defined in the header and initialized in initialize.c
+
+	/*convert the velocity from inertial frame to body frame */
+	Rotate(v, vel_eci, rot);
+	DIVIDE_BY_CONSTANT(v, 1/1000);
+	/*
+	v[0] = 1000 * (rot[0][0] * vel_eci[0] + rot[0][1] * vel_eci[1] + rot[0][2] * vel_eci[2]);
+	v[1] = 1000 * (rot[1][0] * vel_eci[0] + rot[1][1] * vel_eci[1] + rot[1][2] * vel_eci[2]);
+	v[2] = 1000 * (rot[2][0] * vel_eci[0] + rot[2][1] * vel_eci[1] + rot[2][2] * vel_eci[2]);
+	*/
+	/* calculate the magnitude of velocity */
+	vmagnitude = magnitude(v);
+	/*normalize velocity vector */
+	DIVIDE_BY_CONSTANT(v, vmagnitude);
+
+	/*Calculate drag force in along all the 3 axes separately */
+	for(i = 0; i < 3; i++) {
+		f[i] = -1.0 / (2.0) * density * drag_coefficient * surface_area * (fabs(v[0]) + fabs(v[1]) + fabs(v[2])) * vmagnitude * vmagnitude * v[i];
+	}
+
+	/*Calculate the torque */
+	/*finding torque in SI units as r X F */
+	*(torque + 0) = cp_cm[1] * f[2] - f[1] * cp_cm[2];
+	*(torque + 1) = f[0] * cp_cm[2] - cp_cm[0] * f[2];
+	*(torque + 2) = cp_cm[0] * f[1] - f[0] * cp_cm[1];
+	//      printf("%e\t%e\t%e\n",torque[0],torque[1],torque[2]);
+
+	return;
+
+}
+#include<math.h>
+#include"dynamics.h"
+#include"header.h"
+
+void quaternion_to_matrix(double rot[3][3], double *q) {
+	rot[0][0] = 1 - 2 * (q[2] * q[2] + q[1] * q[1]);
+	rot[0][1] = 2 * (q[0] * q[1] + q[3] * q[2]);
+	rot[0][2] = 2 * (q[2] * q[0] - q[3] * q[1]);
+	rot[1][0] = 2 * (q[0] * q[1] - q[3] * q[2]);
+	rot[1][1] = 1 - 2 * (q[0] * q[0] + q[2] * q[2]);
+	rot[1][2] = 2 * (q[1] * q[2] + q[3] * q[0]);
+	rot[2][0] = 2 * (q[2] * q[0] + q[3] * q[1]);
+	rot[2][1] = 2 * (q[1] * q[2] - q[3] * q[0]);
+	rot[2][2] = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
+}
+
+double determinant(double a[3][3], int k) {
+	double s = 1, det = 0, b[3][3];
+	int z, j, m, n, c;
+	if(k == 1) {
+		return (a[0][0]);
+	}
+	else {
+		det = 0;
+		for(c = 0; c < k; c++) {
+			m = 0;
+			n = 0;
+			for(z = 0; z < k; z++) {
+				for(j = 0; j < k; j++) {
+					b[z][j] = 0;
+					if(z != 0 && j != c) {
+						b[m][n] = a[z][j];
+						if(n < (k - 2))
+							n++;
+						else {
+							n = 0;
+							m++;
+						}
+					}
+				}
+			}
+			det = det + s * (a[0][c] * determinant(b, k - 1));
+			s = -1 * s;
+		}
+	}
+
+	return (det);
+}
+
+void cofactor(double num[3][3], int f, double inv[3][3]) {
+	double b[3][3], fac[3][3], d;
+	int p, q, m, n, z, j;
+	for(q = 0; q < f; q++) {
+		for(p = 0; p < f; p++) {
+			m = 0;
+			n = 0;
+			for(z = 0; z < f; z++) {
+				for(j = 0; j < f; j++) {
+					if(z != q && j != p) {
+						b[m][n] = num[z][j];
+						if(n < (f - 2))
+							n++;
+						else {
+							n = 0;
+							m++;
+						}
+					}
+				}
+			}
+			fac[q][p] = pow(-1, q + p) * determinant(b, f - 1);
+		}
+	}
+	transpose(inv, fac);
+	d = determinant(num, f);
+	for(z = 0; z < f; z++) {
+		for(j = 0; j < f; j++) {
+			inv[z][j] = fac[j][z] / d;
+		}
+	}
+}
+
+void mat_multiply(int N, int M, int K, double res[][K], double mat1[][M], double mat2[][K]) {
+	//NxM into MxK
+	int i, j, k;
+	for(i = 0; i < N; i++) {
+		for(j = 0; j < M; j++) {
+			res[i][j] = 0;
+			for(k = 0; k < K; k++) {
+				res[i][j] += mat1[i][k] * mat2[k][j];
+			}
+		}
+	}
+}
+
+void rot_to_q(double *q, double rot[3][3]) {
+	q[3] = 0.5 * sqrt(1 + rot[0][0] + rot[1][1] + rot[2][2]);
+	q[0] = (0.25 / q[3]) * (rot[1][2] - rot[2][1]);
+	q[1] = (0.25 / q[3]) * (rot[2][0] - rot[0][2]);
+	q[2] = (0.25 / q[3]) * (rot[0][1] - rot[1][0]);
+}
+
+void eceftoeci(double *eci, double *ecef, double sidereal) {
+	eci[0] = cos(sidereal) * ecef[0] - sin(sidereal) * ecef[1];
+	eci[1] = sin(sidereal) * ecef[0] + cos(sidereal) * ecef[1];
+	eci[2] = ecef[2];
+}
+void ecitoecef(double *ecef,double *eci,double sidereal){
+	ecef[0]=cos(sidereal)*eci[0] + sin(sidereal)*eci[1];
+	ecef[1]=-sin(sidereal)*eci[0] + cos(sidereal)*eci[1];
+	ecef[2]=eci[2];
+}
+
+void ecefsat(double rad, double latitude, double longitude, double *satecef) {
+	satecef[0] = rad * 1e3 * cos(latitude * _pi / 180) * cos(longitude * _pi / 180);
+	satecef[1] = rad * 1e3 * cos(latitude * _pi / 180) * sin(longitude * _pi / 180);
+	satecef[2] = rad * 1e3 * sin(latitude * _pi / 180);
+}
+
+double magnitude(double *vector) {
+	double magnitude;
+	magnitude = sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
+	return magnitude;
+}
+
+double unitvector(double *uvector, double *vector) {
+	double magnitudeu;
+	magnitudeu = magnitude(vector);
+	uvector[0] = vector[0] / magnitudeu;
+	uvector[1] = vector[1] / magnitudeu;
+	uvector[2] = vector[2] / magnitudeu;
+	return magnitudeu;
+}
+
+double q_normalize(double *q_out, double *q_in) {
+	double mag = sqrt(q_in[0] * q_in[0] + q_in[1] * q_in[1] + q_in[2] * q_in[2] + q_in[3] * q_in[3]);
+	int j;
+	for(j = 0; j < 4; j++)
+		q_out[j] = q_in[j] / mag;
+	return mag;
+}
+/* Calculation of the earth's magnetic field in the inertial frame */
+#include"header.h"
+
+#define NUM 104
+#define MAX 13
+void read_param(double *gn, double *gm, double *gvali, double *gsvi, double *hn, double *hm, double *hvali, double *hsvi) {
+	int i;
+	FILE *fpg, *fph;
+
+	fpg = fopen("./dat/igrfSg.txt", "r");
+	fph = fopen("./dat/igrfSh.txt", "r");
+
+	for(i = 0; i < NUM; i++) {
+		fscanf(fpg, "%lf %lf %lf %lf", &gn[i], &gm[i], &gvali[i], &gsvi[i]);
+		fscanf(fph, "%lf %lf %lf %lf", &hn[i], &hm[i], &hvali[i], &hsvi[i]);
+	}
+	fclose(fpg);
+	fclose(fph);
+
+}
+
+void getMagfield() {
+	int i, k1, k2;
+	double gn[NUM], gm[NUM], gvali[NUM], gsvi[NUM];
+	double hn[NUM], hm[NUM], hvali[NUM], hsvi[NUM];
+	double mag_i[3];
+	double g[MAX + 1][MAX + 2], h[MAX + 1][MAX + 2];
+	double Br, Bt, Bp;
+	double P11, P10, dP11, dP10, P2, dP2, P20=0, dP20=0, K;
+	int m, n;
+	double cost;
+	double sint;
+	double cosm, sinm;
+	double arval;
+	double ar;
+	double colat;
+	int sample;
+	double lon;
+	double lst;
+	/* Outermost loop does the calculation for all the samples */
+	double lat, longitude, radius, sidereal, v1, v2, v3, days;
+
+	/* Get the values for co-efficients */
+	read_param(gn, gm, gvali, gsvi, hn, hm, hvali, hsvi);
+
+	for(sample = 0; sample < (samples); sample++) {
+		/* Removal of singularity */
+		read_file(f_sgp4_read1, "%lf%lf%lf%lf%lf%lf%lf%lf", &days, &lat, &longitude, &radius, &sidereal, &v1, &v2, &v3);
+		UNUSED(v1);
+		UNUSED(v2);
+		UNUSED(v3);
+		if(lat > -0.00000001 && lat < 0.00000001)
+			lat = 0.00000001;
+		else if(lat < 180.00000001 && lat > 179.99999999)
+			lat = 179.99999999;
+
+		/* Conversion from latitude to co-latitude. Also do the d2r conversion */
+		colat = (90 - lat) * _pi / 180;
+		lon = longitude * _pi / 180;
+
+		/* Get the legendre co-efficients */
+
+		for(i = 0; i < NUM; i++) {
+			k1 = gn[i];
+			k2 = gm[i] + 1;
+
+			g[k1][k2] = gvali[i] + gsvi[i] * days / 365;
+			h[k1][k2] = hvali[i] + hsvi[i] * days / 365;
+		}
+
+		/* A simple initialization for performance reasons */
+		ar = xkmper / radius;
+
+		Br = 0;
+		Bt = 0;
+		Bp = 0;
+		P11 = 1;
+		P10 = P11;
+		dP11 = 0;
+		dP10 = dP11;
+
+		/* Outside initialization for performance */
+		cost = cos(colat);
+		sint = sin(colat);
+		//printf("%lf %lf\n",cost,sint);
+
+		for(m = 0; m <= MAX; m++) {
+			cosm = cos(m * lon);
+			sinm = sin(m * lon);
+
+			arval = ar * ar;	// Value at n = 0;
+
+			for(n = 1; n <= MAX; n++) {
+
+				arval = arval * ar;
+
+				if(m <= n) {
+					//Calculate Legendre polynomials and derivatives recursively
+					if(n == m) {
+						P2 = sint * P11;
+						dP2 = sint * dP11 + cost * P11;
+						P11 = P2;
+						P10 = P11;
+						P20 = 0;
+						dP11 = dP2;
+						dP10 = dP11;
+						dP20 = 0;
+					}
+					else if(n == 1) {
+						P2 = cost * P10;
+						dP2 = cost * dP10 - sint * P10;
+						P20 = P10;
+						P10 = P2;
+						dP20 = dP10;
+						dP10 = dP2;
+					}
+					else {
+						K = (double) ((n - 1) * (n - 1) - m * m) / ((2 * n - 1) * (2 * n - 3));	//((n-1)^2-m^2)/((2*n-1)*(2*n-3));
+						P2 = cost * P10 - K * P20;
+						dP2 = cost * dP10 - sint * P10 - K * dP20;
+						P20 = P10;
+						P10 = P2;
+						dP20 = dP10;
+						dP10 = dP2;
+					}
+
+					Br = Br + arval * (n + 1) * ((g[n][m + 1] * cosm + h[n][m + 1] * sinm) * P2);
+					Bt = Bt + arval * ((g[n][m + 1] * cosm + h[n][m + 1] * sinm) * dP2);
+					Bp = Bp + arval * (m * (-g[n][m + 1] * sinm + h[n][m + 1] * cosm) * P2);
+				}
+			}
+		}
+
+		/* Final multiplications */
+		Br = Br / pow(10, 9);
+		Bt = -Bt / pow(10, 9);
+		Bp = -Bp / sint / pow(10, 9);
+		//  printf("%lf\t%lf\t%lf\n",Br,Bt,Bp);
+
+		/* Conversion to ECI framce */
+		lst = sidereal + (longitude * _pi / 180);
+		if(lst > 2 * _pi)
+			lst = lst - 2 * _pi;
+		mag_i[0] = (Br * sin(colat) + Bt * cos(colat)) * cos(lst) - Bp * sin(lst);
+		mag_i[1] = (Br * sin(colat) + Bt * cos(colat)) * sin(lst) + Bp * cos(lst);
+		mag_i[2] = (Br * cos(colat) - Bt * sin(colat));
+		//write_file(f_igrf_write, "%17.10e\t%17.10e\t%17.10e\n", mag_i[0], mag_i[1], mag_i[2]);
+		write_file(f_igrf_write, "%e\t%e\t%e\n", mag_i[0], mag_i[1], mag_i[2]);
+	}
+}
+/* -------------------------------------------------------------------- */
+/* ---------  N R L M S I S E - 0 0    M O D E L    2 0 0 1  ---------- */
+/* -------------------------------------------------------------------- */
+
+/* This file is part of the NRLMSISE-00  C source code package - release
+ * 20041227
+ *
+ * The NRLMSISE-00 model was developed by Mike Picone, Alan Hedin, and
+ * Doug Drob. They also wrote a NRLMSISE-00 distribution package in 
+ * FORTRAN which is available at
+ * http://uap-www.nrl.navy.mil/models_web/msis/msis_home.htm
+ *
+ * Dominik Brodowski implemented and maintains this C version. You can
+ * reach him at mail@brodo.de. See the file "DOCUMENTATION" for details,
+ * and check http://www.brodo.de/english/pub/nrlmsise/index.html for
+ * updated releases of this package.
+ */
+
+
+
+/* ------------------------------------------------------------------- */
+/* ------------------------------ INCLUDES --------------------------- */
+/* ------------------------------------------------------------------- */
+
+#include <stdio.h>
+#include "nrlmsise-00.h"
+#include "jd_to_utc.h"
+#include "nrlmsise_density.h"
+
+#define DEBUG_PRINT 0
+#define  Re  6378137
+
+
+/* ------------------------------------------------------------------- */
+/* ----------------------------- TEST_GTD7 --------------------------- */
+/* ------------------------------------------------------------------- */
+
+double nrlmsise_density(double julian_day,double rad,double latitude, double longitude) {
+	struct nrlmsise_output output;
+	struct nrlmsise_input input;
+	struct nrlmsise_flags flags;
+	struct jd_time tm;
+	tm = jd_to_utc(julian_day);
+	int i;
+	static int count = 0;
+	/* input values */
+
+	// Output in SI units
+	flags.switches[0]=1;
+	for (i=1;i<24;i++)
+	{
+		flags.switches[i]=1;
+	}
+	/* 172         172         172
+	   UT           29000       29000       75000       29000       29000
+	   ALT            400         400        1000         100         400
+	   LAT             60          60          60          60           0
+	   LONG           -70         -70         -70         -70         -70
+	   LST             16          16          16          16          16
+	   F107A          150         150         150         150         150
+	   F107           150         150         150         150         150
+	   */
+
+
+	input.doy=tm.D;
+	input.year=tm.Y; /* without effect */
+	input.sec=tm.sec;
+	//input.alt = 640;
+	input.alt=rad - Re/1000;
+	input.g_lat=latitude;
+	input.g_long=longitude;
+	input.lst=input.sec/3600 + input.g_long/15;
+	input.f107A=150;
+	input.f107=150;
+	input.ap=4;
+	count++;
+	gtd7(&input, &flags, &output);
+
+	if (count % 3600 == 0 && DEBUG_PRINT)
+	{
+		printf("\nDAY   ");
+		printf("         %3i",input.doy);
+		printf("\nUT    ");
+		printf("       %5.0f",input.sec);
+		printf("\nALT   ");
+		printf("        %4.0f",input.alt);
+		printf("\nLAT   ");
+		printf("         %3.0f",input.g_lat);
+		printf("\nLONG  ");
+		printf("         %3.0f",input.g_long);
+		printf("\nLST   ");
+		printf("       %5.0f",input.lst);
+		printf("\nF107A ");
+		printf("         %3.0f",input.f107A);
+		printf("\nF107  ");
+		printf("         %3.0f",input.f107);
+		printf("\n\n");
+		printf("\nTINF  ");
+		printf("     %7.2f",output.t[0]);
+		printf("\nTG    ");
+		printf("     %7.2f",output.t[1]);
+		printf("\nHE    ");
+		printf("   %1.3e",output.d[0]);
+		printf("\nO     ");
+		printf("   %1.3e",output.d[1]);
+		printf("\nN2    ");
+		printf("   %1.3e",output.d[2]);
+		printf("\nO2    ");
+		printf("   %1.3e",output.d[3]);
+		printf("\nAR    ");
+		printf("   %1.3e",output.d[4]);
+		printf("\nH     ");
+		printf("   %1.3e",output.d[6]);
+		printf("\nN     ");
+		printf("   %1.3e",output.d[7]);
+		printf("\nANM 0 ");
+		printf("   %1.3e",output.d[8]);
+		printf("\nRHO   ");
+		printf("   %1.3e",output.d[5]);
+		printf("\n");
+
+	}
+
+
+
+		//printf("%lf\t%lf\t%lf\t%e\n",rad,(rad-Re)/1000,input.alt,output.d[5]);
+
+
+	/* evaluate 0 to 14 */
+	/*printf("Density\t\tAltitude\n");
+	  for (int i = 400; i < 1200; i += 10)
+	  {
+	  input.alt = i;
+	  if (!PRINT_NICE)
+	  {
+	  printf("%E \t",input.alt);
+	  printf("%E \n",output.d[5]);
+	  }
+	  if (PRINT_NICE)
+	  {
+	  printf("\nDAY   ");
+	  printf("         %3i",input.doy);
+	  printf("\nUT    ");
+	  printf("       %5.0f",input.sec);
+	  printf("\nALT   ");
+	  printf("        %4.0f",input.alt);
+	  printf("\nLAT   ");
+	  printf("         %3.0f",input.g_lat);
+	  printf("\nLONG  ");
+	  printf("         %3.0f",input.g_long);
+	  printf("\nLST   ");
+	  printf("       %5.0f",input.lst);
+	  printf("\nF107A ");
+	  printf("         %3.0f",input.f107A);
+	  printf("\nF107  ");
+	  printf("         %3.0f",input.f107);
+	  printf("\n\n");
+	  printf("\nTINF  ");
+	  printf("     %7.2f",output.t[0]);
+	  printf("\nTG    ");
+	  printf("     %7.2f",output.t[1]);
+	  printf("\nHE    ");
+	  printf("   %1.3e",output.d[0]);
+	  printf("\nO     ");
+	  printf("   %1.3e",output.d[1]);
+	  printf("\nN2    ");
+	  printf("   %1.3e",output.d[2]);
+	  printf("\nO2    ");
+	  printf("   %1.3e",output.d[3]);
+	  printf("\nAR    ");
+	  printf("   %1.3e",output.d[4]);
+	  printf("\nH     ");
+	  printf("   %1.3e",output.d[6]);
+	  printf("\nN     ");
+	  printf("   %1.3e",output.d[7]);
+	  printf("\nANM 0 ");
+	  printf("   %1.3e",output.d[8]);
+	  printf("\nRHO   ");
+	  printf("   %1.3e",output.d[5]);
+	  printf("\n");
+
+	  }
+	  }
+	  */
+	/* DL omitted */
+	return output.d[5];
+}
+
+
+/* ------------------------------------------------------------------- */
+/* -------------------------------- MAIN ----------------------------- */
+/* ------------------------------------------------------------------- */
+
+
+/*Simulation code for CSAT2 ACS
+Date: 19/12/2015
+*/
+
+//#include<fenv.h>
+#include "header.h"
+#include "dynamics.h"
+#define dyncrep 1
+
+int feenableexcept(int excepts);
+
+int main(int argc, char *argv[]) {
+
+	int months = 0, days =4, hours = 0, dync = 0;
+	sgp_mag_flag =1;
+	samples = (months * 30 * DAY_SECONDS + days * DAY_SECONDS + hours * 3600) / interval_sim;
+	//int feerror = feenableexcept(FE_DIVBYZERO | FE_UNDERFLOW | FE_OVERFLOW);
+	//UNUSED(feerror);
+	char *results_directory, default_results_directory[] = "./results";
+	if(argc > 1)
+		results_directory = argv[1];
+	else
+		results_directory = default_results_directory;
+	int err;
+	char today_results_directory[150];
+
+	/**--------------------------------For including time in filenames of the results------------------------------------**/
+	time_t current_time = time(NULL);
+	struct tm tm = *localtime(&current_time);
+	int today_date = tm.tm_mday;
+	int today_month = tm.tm_mon + 1;
+	int today_year = tm.tm_year + 1900;
+
+	struct stat st = { 0 };
+	for(ini_angle = 180; ini_angle <= 180; ini_angle += 90) {
+		sprintf(today_results_directory, "%s/%d_%d_%d_%d_CSAT2", results_directory, (int)ini_angle, today_year, today_month, today_date);
+
+		mode_t process_mask = umask(0);
+		if(stat(results_directory, &st) == -1) {
+			err = mkdir(results_directory, 0755);
+			if(err < 0) {
+				printf("error creating directory %s\n", results_directory);
+				exit(0);
+			}
+		}
+		if(stat(today_results_directory, &st) == -1) {
+			err = mkdir(today_results_directory, 0755);
+			if(err < 0) {
+				printf("error creating directory %s\n", today_results_directory);
+				exit(0);
+			}
+		}
+		umask(process_mask);
+
+		for(dync = 0; dync < dyncrep; dync++) {
+			openfiles(today_results_directory);
+			if(sgp_mag_flag) {
+				printf("Generating SGP4 and IGRF data\n");
+				sgp4();
+				fflush(f_sgp4_write);
+				getMagfield();
+				fflush(f_igrf_write);
+			}
+			printf("Dynamics\n");
+			dynamics();
+		}
+		printf("dynamics done\n");
+		// ptangle(&filename);
+		// printf("after ptangle");
+	}
+
+	closefiles();
+	return 0;
+}
+#include "dynamics.h"
+#include "header.h"
+#include "sgp.h"
+#include <stdio.h>
+#include <errno.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <time.h>
+
+long int samples;
+int sgp_mag_flag;
+
+int count;
+double jd_zero_time;
+double run_time;
+double M_residual1[3], M_residual2[3];
+double ini_angle;
+
+FILE *f_sgp4_read1, *f_igrf_write;
+FILE *f_sgp4_write, *f_sgp4_read2, *f_igrf_read;
+FILE *f_rpy;
+FILE *f_std_zaxis;
+FILE *f_angular_velocity;
+FILE *f_total_torque;
+FILE *f_torquer_magnetic_moment;
+FILE *f_bdot;
+FILE *f_torquer_currents;
+FILE *f_error_vec_nadir;
+FILE *f_sun_angle;
+FILE *f_quaternion_orbital;
+FILE *f_zaxiscomm;
+FILE *f_panel_sun_angles;
+FILE *f_reaction_wheel; 
+FILE *f_radiation_cone_angle;
+FILE *f_cone;
+FILE *f_passtime;
+/*---------------------------All variables related with the pointing angles code---------------------------------------*/
+double gs_lat, gs_long, gs_el, gs_geo[3];
+double pointingAngle;
+double starttime;
+int *view_indices;
+int pass;
+double tot_com, total;
+int grp1, grp2, grp3, grp4, grp5, grp6, grp7, grp8, grp9, grp10, grp11, grp12, grp13, grp14;
+double wx, wy, wz;		//added 28/7/15
+double link_time,pass_time;
+
+char SGP[FILENAME_MAX_SIZE] = "SGP4.txt";
+char MAG[FILENAME_MAX_SIZE] = "magField.txt";
+
+void openfiles(char *today_results_directory) {
+	char original_directory[FILENAME_MAX_SIZE];
+	if(getcwd(original_directory, FILENAME_MAX_SIZE) == NULL) {
+		printf("%s:%s:%s:", __FILE__, __func__, original_directory);
+		fflush(stdout);
+		perror("");
+		exit(0);
+	}
+
+	f_sgp4_read1 = fopen(SGP, "r");
+	if(f_sgp4_read1 == NULL || sgp_mag_flag == 1) {
+		sgp_mag_flag = 1;
+		open_for_write(&f_sgp4_write, SGP);
+		
+		/* used in IGRF */
+		open_for_read(&f_sgp4_read1, SGP);
+
+		open_for_write(&f_igrf_write, MAG);
+	}
+
+	open_for_read(&f_sgp4_read2, SGP);
+
+	open_for_read(&f_igrf_read, MAG);
+
+	if(chdir(today_results_directory) == -1) {
+		printf("%s:%s:%d:%s:", __FILE__, __func__, __LINE__, today_results_directory);
+		fflush(stdout);
+		perror("");
+		exit(0);
+	}
+	open_for_write(&f_rpy, "rpyangles.txt");
+
+	open_for_write(&f_std_zaxis, "std_zaxis.txt");
+
+	open_for_write(&f_angular_velocity, "angular_velocities.txt");
+
+	open_for_write(&f_total_torque, "total_torque.txt");
+
+	if(chdir(original_directory) == -1) {
+		printf("%s:%s:%d:%s:", __FILE__, __func__, __LINE__, original_directory);
+		fflush(stdout);
+		perror("");
+		exit(0);
+	}
+	open_for_write(&f_torquer_magnetic_moment, "torquer_magnetic_moment.txt");
+	open_for_write(&f_bdot, "bdot.txt");
+	open_for_write(&f_torquer_currents, "torquer_currents.txt");
+	open_for_write(&f_error_vec_nadir, "thetaerror.txt");
+	open_for_write(&f_sun_angle, "sun_angle.txt");
+	open_for_write(&f_quaternion_orbital, "quaternion_orbital.txt");
+	open_for_write(&f_zaxiscomm, "std_zaxis2.838-0.56-0.56-180_50C.txt");
+	open_for_write(&f_panel_sun_angles, "panel_sun_angles.txt");
+	open_for_write(&f_reaction_wheel, "reaction_wheel.txt");
+	open_for_write(&f_radiation_cone_angle,"radiation_cone_angle.txt");
+	open_for_write(&f_cone,"cone.txt");
+	open_for_write(&f_passtime,"passtime.txt");
+
+}
+void closefiles() {
+	if(sgp_mag_flag == 1) {
+		fclose(f_igrf_write);
+		fclose(f_sgp4_write);
+	}
+	fclose(f_sgp4_read1);
+	fclose(f_sgp4_read2);
+	fclose(f_igrf_read);
+	fclose(f_rpy);
+	fclose(f_std_zaxis);
+	fclose(f_angular_velocity);
+	fclose(f_total_torque);
+	fclose(f_torquer_magnetic_moment);
+	fclose(f_bdot);
+	fclose(f_torquer_currents);
+	fclose(f_error_vec_nadir);
+	fclose(f_sun_angle);
+	fclose(f_quaternion_orbital);
+	fclose(f_zaxiscomm);
+	fclose(f_panel_sun_angles);
+	fclose(f_reaction_wheel); 
+}
+
+void open_for_write(FILE **f, const char *filename) {
+	*f = fopen(filename, "w+");
+	if(*f == NULL) {
+		perror(filename);
+		exit(errno);
+	}
+}
+
+void open_for_read(FILE **f, const char *filename) {
+	*f = fopen(filename, "r");
+	if(*f == NULL) {
+		perror(filename);
+		exit(errno);
+	}
+}
+
+void write_file(FILE *f, const char* format, ...) {
+	va_list args;
+	va_start(args, format);
+        if(vfprintf(f, format, args) == EOF) {
+		char location[FILENAME_MAX_SIZE], filename[FILENAME_MAX_SIZE];
+		int ret, fno;
+		fno = fileno(f);
+		sprintf(location, "/proc/self/fd/%d", fno);
+		if((ret = readlink(location, filename, FILENAME_MAX_SIZE )) > 0) {
+			filename[ret] = '\0';
+			printf("%s: could not execute %s()\n", filename, __func__);
+		}
+		else {
+			printf("Failure in %s() function\n", __func__);
+		}
+		exit(0);
+	}
+	va_end(args);
+}
+
+void read_file(FILE *f, const char* format, ...) {
+	va_list args;
+	va_start(args, format);
+        if(vfscanf(f, format, args) == EOF) {
+		char location[FILENAME_MAX_SIZE], filename[FILENAME_MAX_SIZE];
+		int ret, fno;
+		fno = fileno(f);
+		sprintf(location, "/proc/self/fd/%d", fno);
+		if((ret = readlink(location, filename, FILENAME_MAX_SIZE )) > 0) {
+			filename[ret] = '\0';
+			printf("%s: could not execute %s()\n", filename, __func__);
+		}
+		else {
+			printf("Failure in %s() function\n", __func__);
+		}
+		exit(0);
+	}
+}
+#ifndef __HEADER_H
+#define __HEADER_H
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+
+#ifndef __JD_TO_UTC__H
+#include "jd_to_utc.h"
+#endif
+
+#include "nrlmsise_density.h"
+#include "sgp.h"
+
+#define UNUSED(var) ((void)var)
+
+#define FILENAME_MAX_SIZE (150)
+
+#define _xmnpda (1440.0)
+#define _secday (86400.0)
+#define _pi (3.1415926535897932384626433279)
+#define xkmper (6378.135)
+#define jdreference (2451545)
+#define Re (6378137)
+#define Te (86400.0)
+#define Gme (398600.4418e9)
+#define u0 (12.566370614e-7)
+#define DAY_SECONDS (86400)
+#define interval_sim (0.1)
+
+extern long int samples;
+extern int sgp_mag_flag;
+
+extern FILE *f_sgp4_read1, *f_igrf_write;
+extern FILE *f_sgp4_write, *f_sgp4_read2, *f_igrf_read;
+extern FILE *f_rpy;
+extern FILE *f_std_zaxis;
+extern FILE *f_angular_velocity;
+extern FILE *f_total_torque;
+extern FILE *f_torquer_magnetic_moment;
+extern FILE *f_bdot;
+extern FILE *f_torquer_currents;
+extern FILE *f_error_vec_nadir;
+extern FILE *f_sun_angle;
+extern FILE *f_quaternion_orbital;
+extern FILE *f_zaxiscomm;
+extern FILE *f_panel_sun_angles;
+extern FILE *f_reaction_wheel; 
+extern FILE *f_radiation_cone_angle;
+extern FILE *f_cone;
+extern FILE *f_passtime;
+
+extern int count;
+extern double run_time;
+extern double M_residual1[3], M_residual2[3];
+extern double ini_angle;
+extern double jd_zero_time;
+
+extern char SGP[FILENAME_MAX_SIZE], MAG[FILENAME_MAX_SIZE];
+
+/*---------------------------All variables related with the pointing angles code---------------------------------------*/
+#define d_to_r(x) ((x) * (_pi/180))
+#define r_to_d(x) ((x) * (180/_pi))
+/*#define transpose(rotr ,rotmat)(rotr[0][0] = rotmat[0][0], rotr[0][1] = rotmat[1][0], rotr[0][2] = rotmat[2][0], rotr[1][0] = rotmat[0][1], rotr[1][1] = rotmat[1][1], rotr[1][2] = rotmat[2][1], rotr[2][0] = rotmat[0][2], rotr[2][1] = rotmat[1][2], rotr[2][2] = rotmat[2][2])
+*/
+extern double gs_lat, gs_long, gs_el, gs_geo[3];
+extern double pointingAngle;
+extern double starttime;
+extern int *view_indices;
+extern int pass;
+extern double tot_com, total;
+extern int grp1, grp2, grp3, grp4, grp5, grp6, grp7, grp8, grp9, grp10, grp11, grp12, grp13, grp14;
+extern double wx, wy, wz;		//added 28/7/15
+extern double link_time, pass_time;
+/*----------------------------------------------------------------------------------------------------------------------*/
+
+/*------------------------ function to normalize a vector---------------------------------------------------------------*/
+#define DIVIDE_BY_CONSTANT(vector,magnitude)(vector[0] = vector[0]/magnitude,vector[1] = vector[1]/magnitude,vector[2] = vector[2]/magnitude)
+ /*----------------------------------------------------------------------------------------------------------------------*/
+
+ /** --------------------------------------------------------------------------------------------------------------*/
+void initialize_constants();
+void initialize_variables();
+void initialize_orbital();
+void orbit();
+
+void getMagfield();
+void dynamics();
+void ptangle();
+void sgp4();
+void comm_fea(double,double,double,double,double*);
+
+void openfiles();
+void closefiles();
+void open_for_write(FILE**, const char*);
+void open_for_read(FILE**, const char*);
+void read_file(FILE*, const char*, ...);
+void write_file(FILE*, const char*, ...);
+#endif

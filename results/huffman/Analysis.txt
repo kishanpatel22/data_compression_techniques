@@ -1,0 +1,27 @@
+1. Canonical huffman compression -
+
+(The given below are the test results for only text-files)
+
+  Filesize        Compressed Size      Compression Time     Decompression Time
+  (.txt)              (.kp)              (in sec)               (in sec)
+   
+  5kb                3.1kb                0.012                 0.007
+  55kb               37.3kb               0.077                 0.040
+  109.5kb            67.2kb               0.093                 0.053
+  200.4kb            100.9kb              0.147                 0.108
+  511.2kb            274.4kb              0.396                 0.245 
+  1.02MB             0.55MB               1.701                 1.023  
+  2.5MB              1.27MB               2.433                 1.900
+
+Important points to note are - 
+
+1. Average Compression ratio achived is 1.56 for all text files compressed. 
+2. High compression is achieved for files have many repeating characters. 
+3. Provides better results on large text files.
+
+Failures -
+
+1. Only text files are compressed and bianry files given are actaully
+overcompressed. And thus the code is applicable for text files only.
+
+2. The tree maintaing for decoder is a tedious work.

@@ -1,0 +1,29 @@
+1. LZW (dynamic dictioanary technique)- 
+
+(The given below are the test results for only text-files)
+
+  Filesize        Compressed Size      Compression Time     Decompression Time
+  (.txt)              (.kp)              (in sec)               (in sec)
+   
+  25kb               17.1kb               0.004                 0.001
+  55kb               30.3kb               0.017                 0.010
+  109.5kb            51.2kb               0.043                 0.021
+  200.4kb            98.12kb              0.102                 0.080
+  511.2kb            260.4kb              0.396                 0.245 
+  1.02MB             0.50MB               0.701                 0.323  
+  2.5MB              1.20MB               1.433                 0.900
+
+Important points to note are - 
+
+1. Average Compression ratio achived around 2.1 for all text files compressed. 
+
+2. High compression is achieved for files have many repeating characters. 
+
+3. Provides better results on large text files.
+
+4. Only text files are compressed and bianry files given are actaully
+overcompressed. (NULL character problem in the code)
+
+5. Due to Dynamic dictionary there is a problem while decompression certain
+specific files. The problem to due to updating the dictionary and current bit
+lenght.
